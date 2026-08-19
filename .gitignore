@@ -12,3 +12,11 @@ __pycache__/
 # Редакторы
 .vscode/
 .idea/
+
+# Логи
+bot.log*
+
+# Связь с панелью управления
+crm_queue.jsonl
+crm_config_cache.json
+incoming_media/

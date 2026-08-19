@@ -3,3 +3,4 @@ anthropic>=0.49
 openai>=1.60
 google-genai>=2.0
 python-dotenv>=1.0
+httpx>=0.27

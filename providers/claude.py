@@ -17,6 +17,7 @@ providers/claude.py — работа с Claude через официальный
 from anthropic import (
     APIConnectionError,
     APIStatusError,
+    APITimeoutError,
     AsyncAnthropic,
     AuthenticationError,
     RateLimitError,
@@ -31,11 +32,19 @@ class ClaudeProvider(LLMProvider):
     title = "Claude (Anthropic)"
 
     def __init__(self) -> None:
-        if not settings.anthropic_api_key:
+        from providers import override_for
+        override = override_for("claude")
+        api_key = override.get("key") or settings.anthropic_api_key
+        model = override.get("model") or settings.anthropic_model
+        if not api_key:
             raise ProviderError("Не задан ANTHROPIC_API_KEY в файле .env")
         # Async-клиент: не блокирует бота, пока ждём ответ модели.
-        self._client = AsyncAnthropic(api_key=settings.anthropic_api_key)
-        self._model = settings.anthropic_model
+        self._client = AsyncAnthropic(
+            api_key=api_key,
+            timeout=settings.request_timeout,
+            max_retries=2,
+        )
+        self._model = model
 
     async def ask(
         self,
@@ -67,13 +76,26 @@ class ClaudeProvider(LLMProvider):
         try:
             response = await self._client.messages.create(**params)
         except AuthenticationError:
-            raise ProviderError("Claude: неверный API-ключ (проверь ANTHROPIC_API_KEY).")
+            raise ProviderError(
+                "Claude: неверный API-ключ (проверь ANTHROPIC_API_KEY).", retryable=True
+            )
         except RateLimitError:
-            raise ProviderError("Claude: слишком много запросов, подожди немного.")
+            raise ProviderError(
+                "Claude: слишком много запросов, подожди немного.", retryable=True
+            )
+        except APITimeoutError:
+            raise ProviderError(
+                "Claude: сервер долго не отвечает. Попробуй ещё раз.", retryable=True
+            )
         except APIConnectionError:
-            raise ProviderError("Claude: нет связи с сервером. Проверь интернет/VPN.")
+            raise ProviderError(
+                "Claude: нет связи с сервером. Проверь интернет/VPN.", retryable=True
+            )
         except APIStatusError as e:
-            raise ProviderError(f"Claude вернул ошибку {e.status_code}: {e.message}")
+            raise ProviderError(
+                f"Claude вернул ошибку {e.status_code}: {_short(e)}",
+                retryable=e.status_code >= 500,
+            )
 
         # Модель могла отказаться отвечать по соображениям безопасности.
         if response.stop_reason == "refusal":
@@ -84,5 +106,16 @@ class ClaudeProvider(LLMProvider):
         text = "\n".join(parts).strip()
 
         if not text:
+            if response.stop_reason == "max_tokens":
+                raise ProviderError(
+                    "Claude не уложился в лимит длины ответа. Задай вопрос конкретнее."
+                )
             raise ProviderError("Claude вернул пустой ответ. Попробуй переформулировать.")
         return text
+
+
+def _short(error: Exception, limit: int = 200) -> str:
+    """Короткий текст ошибки: полное тело ответа API в чат тащить незачем."""
+    message = getattr(error, "message", None) or str(error)
+    message = " ".join(str(message).split())
+    return message if len(message) <= limit else message[:limit] + "…"

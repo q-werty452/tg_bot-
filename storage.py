@@ -15,6 +15,8 @@ Telegram-бот сам по себе ничего не помнит: каждо�
 память — заменяй этот файл на SQLite/Postgres, остальной код менять не придётся.
 """
 
+import asyncio
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -48,9 +50,23 @@ class Session:
     provider: str
     mode: Mode = Mode.DETAILED
     # История в общем формате: [{"role": "user"|"assistant", "content": "текст"}]
-    # Такой формат понимают оба провайдера, поэтому переключение модели
+    # Такой формат понимают все провайдеры, поэтому переключение модели
     # не ломает диалог.
     history: list[dict] = field(default_factory=list)
+
+    # Замок: пока идёт ответ на одно сообщение этого чата, следующее ждёт.
+    # Без него два быстрых сообщения подряд перемешали бы историю
+    # (получилось бы user, user, assistant, assistant — а API ждёт чередования).
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+    # Время последней активности — по нему чистим давно неактивные чаты.
+    last_seen: float = field(default_factory=time.monotonic)
+
+    # Номер карточки в панели управления (None — панель ещё не отвечала).
+    ticket_id: int | None = None
+
+    # Подтягивали ли мы историю из панели после перезапуска бота.
+    restored: bool = False
 
     def add(self, role: str, content: str, limit: int) -> None:
         """Добавить сообщение в историю и обрезать её, если стала слишком длинной."""
@@ -66,6 +82,17 @@ class Session:
 
     def clear(self) -> None:
         self.history.clear()
+        self.ticket_id = None
+
+    def drop_last(self) -> None:
+        """Убрать последнее сообщение (используем, когда ответ не получился)."""
+        if self.history:
+            self.history.pop()
+
+
+# Через сколько секунд бездействия сессия считается брошенной.
+# 12 часов: человек, вернувшийся на следующий день, всё равно начинает новую тему.
+SESSION_TTL = 12 * 60 * 60
 
 
 class Storage:
@@ -77,6 +104,31 @@ class Storage:
 
     def get(self, chat_id: int) -> Session:
         """Вернуть сессию чата, создав её при первом обращении."""
-        if chat_id not in self._sessions:
-            self._sessions[chat_id] = Session(provider=self._default_provider)
-        return self._sessions[chat_id]
+        session = self._sessions.get(chat_id)
+        if session is None:
+            session = Session(provider=self._default_provider)
+            self._sessions[chat_id] = session
+        session.last_seen = time.monotonic()
+        return session
+
+    def __len__(self) -> int:
+        return len(self._sessions)
+
+    def cleanup(self, ttl: float = SESSION_TTL) -> int:
+        """
+        Удалить сессии, в которых давно ничего не происходило.
+
+        Зачем: бот работает месяцами, а каждая сессия держит в памяти
+        историю переписки. Без уборки память растёт вместе с числом
+        обратившихся жителей. Занятые (отвечающие прямо сейчас) не трогаем.
+        Возвращает количество удалённых.
+        """
+        now = time.monotonic()
+        stale = [
+            chat_id
+            for chat_id, session in self._sessions.items()
+            if now - session.last_seen > ttl and not session.lock.locked()
+        ]
+        for chat_id in stale:
+            del self._sessions[chat_id]
+        return len(stale)
