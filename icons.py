@@ -90,6 +90,7 @@ class _Icons:
     claude = Icon("✳" + TEXT)    # U+2733 — лучи, как у знака Anthropic
     openai = Icon("⬡")           # U+2B21 — контурный шестиугольник
     gemini = Icon("✧")           # U+2727 — четырёхлучевая звезда, как у Gemini
+    openrouter = Icon("⌘")       # U+2318 — «перекрёсток», шлюз к разным моделям
 
     # Действия
     reset = Icon("↺")            # U+21BA

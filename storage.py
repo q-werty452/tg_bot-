@@ -40,6 +40,7 @@ PROVIDER_TITLES = {
     "claude": f"{ICONS.claude}  Claude (Anthropic)",
     "openai": f"{ICONS.openai}  GPT (OpenAI)",
     "gemini": f"{ICONS.gemini}  Gemini (Google)",
+    "openrouter": f"{ICONS.openrouter}  OpenRouter",
 }
 
 

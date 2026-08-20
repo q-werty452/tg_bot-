@@ -19,7 +19,7 @@ load_dotenv()
 
 # Порядок важен: если провайдер по умолчанию недоступен, берём первый
 # доступный из этого списка.
-PROVIDER_ORDER = ("openai", "gemini", "claude")
+PROVIDER_ORDER = ("openai", "gemini", "claude", "openrouter")
 
 
 class ConfigError(RuntimeError):
@@ -30,10 +30,12 @@ class ConfigError(RuntimeError):
 class Settings:
     telegram_token: str
     anthropic_api_key: str | None
+    openrouter_api_key: str | None
     openai_api_key: str | None
     google_api_key: str | None
     default_provider: str
     anthropic_model: str
+    openrouter_model: str
     openai_model: str
     google_model: str
     history_limit: int
@@ -84,27 +86,43 @@ def load_settings() -> Settings:
         "openai": _env("OPENAI_API_KEY") or None,
         "gemini": _env("GOOGLE_API_KEY") or None,
         "claude": _env("ANTHROPIC_API_KEY") or None,
+        "openrouter": _env("OPENROUTER_API_KEY") or None,
     }
 
-    # Какие провайдеры реально можно использовать (есть ключ).
+    crm_url = _env("CRM_URL")
+    crm_token = _env("CRM_BOT_TOKEN")
+
+    # Какие провайдеры можно использовать прямо сейчас (ключ есть в .env).
     usable = [name for name in PROVIDER_ORDER if keys[name]]
-    if not usable:
+    if not usable and not (crm_url and crm_token):
+        # Ключей нет и панели тоже нет — отвечать действительно нечем.
         raise ConfigError(
-            "Не задан ни один ключ ИИ (OPENAI_API_KEY / GOOGLE_API_KEY). "
-            "Нужен хотя бы один, иначе боту нечем отвечать. Открой .env и заполни."
+            "Не задан ни один ключ ИИ (OPENAI_API_KEY / GOOGLE_API_KEY / "
+            "OPENROUTER_API_KEY) и не "
+            "подключена панель управления (CRM_URL / CRM_BOT_TOKEN). Нужно "
+            "что-то одно: либо ключ в .env, либо ключи в панели."
         )
+    # Если ключей в файле нет, но панель подключена — это нормальный режим:
+    # ключи хранятся в панели и приезжают по сети (а до первого ответа
+    # берутся из сохранённой на диске копии конфигурации).
 
     default_provider = _env("DEFAULT_PROVIDER", "openai").lower()
-    if default_provider not in usable:
+    if usable and default_provider not in usable:
         default_provider = usable[0]
+    elif default_provider not in PROVIDER_ORDER:
+        default_provider = PROVIDER_ORDER[0]
 
     return Settings(
         telegram_token=token,
         anthropic_api_key=keys["claude"],
+        openrouter_api_key=keys["openrouter"],
         openai_api_key=keys["openai"],
         google_api_key=keys["gemini"],
         default_provider=default_provider,
         anthropic_model=_env("ANTHROPIC_MODEL") or "claude-opus-5",
+        # У OpenRouter сотни моделей — значения по умолчанию нет,
+        # нужную выбирают в панели.
+        openrouter_model=_env("OPENROUTER_MODEL"),
         openai_model=_env("OPENAI_MODEL") or "gpt-4o",
         google_model=_env("GOOGLE_MODEL") or "gemini-3.6-flash",
         # Нечётный лимит истории обрежется до пары "вопрос-ответ" сам,

@@ -27,6 +27,7 @@ _REGISTRY: dict[str, tuple[str, str]] = {
     "openai": ("providers.openai_provider", "OpenAIProvider"),
     "gemini": ("providers.gemini", "GeminiProvider"),
     "claude": ("providers.claude", "ClaudeProvider"),
+    "openrouter": ("providers.openrouter", "OpenRouterProvider"),
 }
 
 # Кэш уже созданных экземпляров.
@@ -49,6 +50,7 @@ _KEY_ATTR = {
     "openai": "openai_api_key",
     "gemini": "google_api_key",
     "claude": "anthropic_api_key",
+    "openrouter": "openrouter_api_key",
 }
 
 

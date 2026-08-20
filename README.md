@@ -27,6 +27,7 @@
 | Провайдер | Начало ключа | Переменная в .env    |
 |-----------|--------------|----------------------|
 | Anthropic | `sk-ant-`    | `ANTHROPIC_API_KEY`  |
+| OpenRouter | `sk-or-v1-` | `OPENROUTER_API_KEY` |
 | OpenAI    | `sk-proj-` / `sk-` | `OPENAI_API_KEY` |
 | Google    | `AIza`       | `GOOGLE_API_KEY`     |
 
@@ -342,6 +343,8 @@ Telegram Premium (в личных чатах, группах и супергру
 | `HISTORY_LIMIT`       | Сколько последних сообщений помнить (по умолч. 20) |
 | `REQUEST_TIMEOUT`     | Сколько секунд ждать ответ ИИ (по умолч. 90)       |
 | `LOG_LEVEL`           | `INFO` обычно, `DEBUG` при разборе проблем         |
+| `OPENROUTER_API_KEY`  | Ключ OpenRouter — шлюза к моделям разных компаний  |
+| `OPENROUTER_MODEL`    | Его модель, имя составное: `openai/gpt-4o-mini`    |
 | `CRM_URL`             | Адрес панели управления; пусто — работать без неё  |
 | `CRM_BOT_TOKEN`       | Служебный токен панели (её `BOT_API_TOKEN`)        |
 

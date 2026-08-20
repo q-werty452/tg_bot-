@@ -832,6 +832,13 @@ async def main() -> None:
 
         logger.info("Бот запущен: @%s (id %s)", me.username, me.id)
 
+        # Забираем конфигурацию до первого сообщения: ключи и модели могут
+        # храниться только в панели, и тогда без этого запроса бот ответил бы
+        # первому жителю «не настроена ни одна модель».
+        if crm.enabled:
+            with contextlib.suppress(Exception):
+                await remote.refresh(crm)
+
         ready = warm_up()  # заранее проверяем ключи, чтобы узнать о проблеме сразу
         logger.info("Провайдер по умолчанию: %s", settings.default_provider)
         logger.info("Доступные провайдеры: %s", ", ".join(ready) or "нет")

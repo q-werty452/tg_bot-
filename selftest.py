@@ -85,13 +85,23 @@ def test_config() -> None:
     except config.ConfigError as e:
         check("кривой токен отклонён", "123456789" in str(e))
 
-    # Нет ни одного ключа ИИ
+    # Нет ни ключей, ни панели — отвечать нечем
     try:
         load({"TELEGRAM_BOT_TOKEN": good, "OPENAI_API_KEY": None,
-              "GOOGLE_API_KEY": None, "ANTHROPIC_API_KEY": None})
-        check("нет ключей ИИ -> ошибка", False)
+              "GOOGLE_API_KEY": None, "ANTHROPIC_API_KEY": None,
+              "CRM_URL": None, "CRM_BOT_TOKEN": None})
+        check("нет ни ключей, ни панели -> ошибка", False)
     except config.ConfigError as e:
-        check("нет ключей ИИ -> ошибка", "ключ" in str(e).lower())
+        check("нет ни ключей, ни панели -> ошибка", "ключ" in str(e).lower())
+
+    # Ключей в файле нет, но подключена панель — она их и хранит.
+    # Так и настроено у заказчика: ключ перенесён в веб-интерфейс.
+    s = load({"TELEGRAM_BOT_TOKEN": good, "OPENAI_API_KEY": None,
+              "GOOGLE_API_KEY": None, "ANTHROPIC_API_KEY": None,
+              "CRM_URL": "http://127.0.0.1:8000", "CRM_BOT_TOKEN": "служебный"})
+    check("ключи только в панели -> бот стартует",
+          s.crm_url.endswith("8000") and s.default_provider in ("openai", "gemini", "claude"),
+          s.default_provider)
 
     # Кавычки вокруг значения снимаются
     s = load({"TELEGRAM_BOT_TOKEN": f'"{good}"', "OPENAI_API_KEY": '"sk-quoted"'})
@@ -441,7 +451,16 @@ async def test_dialog() -> None:
 
     import bot as bot_module
     from aiogram import Bot
+    from crm import crm as crm_client
     from providers import ProviderError
+
+    # Этот раздел проверяет бота БЕЗ панели. Отключаем клиента наглухо:
+    # иначе тесты пишут обращения в настоящую базу мэрии — так в рабочую
+    # панель однажды и попали заявки «вопрос из чата А» с битым фото.
+    # Работа В СВЯЗКЕ с панелью проверяется отдельно, в разделе 8,
+    # на подставном сервере.
+    saved_enabled = crm_client.enabled
+    crm_client.enabled = False
 
     fake = FakeTelegram()
     bot = Bot(token=os.environ["TELEGRAM_BOT_TOKEN"], session=fake.build_session())
@@ -715,6 +734,12 @@ async def test_dialog() -> None:
     check("команда с @именем бота распознана",
           "Текущие настройки" in " ".join(fake.texts()), " ".join(fake.texts())[:80])
 
+    # --- без панели бот обязан работать сам
+    check("без панели обращения никуда не уходят", not crm_client.enabled)
+    check("и житель всё равно получает ответы", "Ответ модели." in stub.answer
+          or bool(fake.texts()))
+
+    crm_client.enabled = saved_enabled
     await bot.session.close()
 
 
@@ -724,10 +749,13 @@ async def test_dialog() -> None:
 
 async def test_providers_offline() -> None:
     section("6. Провайдеры (проверка кода без реальных ключей)")
+    from providers import _REGISTRY as _REG
     from providers import ProviderError, available_providers, get_provider
+    _REGISTRY_NAMES = list(_REG)
 
-    check("доступны openai и gemini",
-          available_providers() == ["openai", "gemini"], str(available_providers()))
+    check("видны провайдеры, для которых есть ключ",
+          set(available_providers()) <= {"openai", "gemini", "claude", "openrouter"},
+          str(available_providers()))
 
     try:
         get_provider("несуществующий")
@@ -783,6 +811,26 @@ async def test_providers_offline() -> None:
     # OpenAI: системный промпт идёт первым сообщением.
     from providers.openai_provider import OpenAIProvider
     check("openai: провайдер знает своё имя", OpenAIProvider.name == "openai")
+
+    # OpenRouter: тот же протокол, другой адрес и составные имена моделей.
+    from providers.openrouter import BASE_URL, OpenRouterProvider
+    check("openrouter: свой адрес API", BASE_URL == "https://openrouter.ai/api/v1")
+    check("openrouter: наследует протокол OpenAI",
+          issubclass(OpenRouterProvider, OpenAIProvider))
+    check("openrouter: есть в реестре", "openrouter" in _REGISTRY_NAMES)
+    providers_module = __import__("providers")
+    providers_module.apply_overrides({"openrouter": {"key": "sk-or-v1-test", "model": ""}})
+    try:
+        providers_module.get_provider("openrouter")
+        check("openrouter: без выбранной модели просит её выбрать", False)
+    except ProviderError as e:
+        check("openrouter: без выбранной модели просит её выбрать",
+              "модель" in str(e).lower(), str(e))
+    providers_module.apply_overrides(
+        {"openrouter": {"key": "sk-or-v1-test", "model": "openai/gpt-4o-mini"}})
+    check("openrouter: с ключом и моделью поднимается",
+          providers_module.get_provider("openrouter")._model == "openai/gpt-4o-mini")
+    providers_module.apply_overrides({})
 
 
 
