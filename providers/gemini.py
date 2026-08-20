@@ -135,6 +135,24 @@ class GeminiProvider(LLMProvider):
                     model=self._model, contents=contents, config=config
                 )
             except genai_errors.ClientError as e:
+                # Часть моделей Google (обычно preview) умеет отвечать только
+                # на одиночный вопрос и падает с 400 на переписке. Житель не
+                # должен из-за этого остаться без ответа: повторяем запрос
+                # с одним последним сообщением.
+                if (e.code == 400 and len(contents) > 1
+                        and "multiturn" in str(getattr(e, "message", e)).lower()):
+                    logger.warning(
+                        "Модель %s не ведёт диалог — отвечаю без истории. "
+                        "Смените модель в панели.", self._model)
+                    try:
+                        response = await self._client.aio.models.generate_content(
+                            model=self._model, contents=contents[-1:], config=config)
+                    except genai_errors.APIError as retry_error:
+                        raise self._to_provider_error(retry_error)
+                    if not detailed:
+                        self._thinking_variant = variant
+                        self._thinking_checked = True
+                    break
                 # 400 на способе отключения размышлений — пробуем следующий.
                 if e.code == 400 and not detailed and variant is not None:
                     logger.info(
