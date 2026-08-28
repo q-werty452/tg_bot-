@@ -983,9 +983,19 @@ async def test_dialog_with_panel() -> None:
     check("ответ ИИ записан в карточку",
           any(path.endswith("/tickets/1/messages/") for path in paths), str(paths))
     check("карточка привязана к сессии", storage.get(chat).ticket_id == 1)
+    # Кнопки оценки сейчас выключены (bot.RATING_BUTTONS_ENABLED), но код жив.
     sends = [c for c in fake.calls if c[0] == "SendMessage" and "reply_markup" in c[1]]
-    check("под ответом есть кнопки оценки",
+    check("выключенные кнопки оценки под ответом не появляются",
+          not any("rate:" in str(c[1].get("reply_markup", "")) for c in sends),
+          str(sends)[:200])
+
+    bot_module.RATING_BUTTONS_ENABLED = True
+    fake.clear()
+    await feed(make_message("вопрос с оценкой", chat_id=chat, message_id=34))
+    sends = [c for c in fake.calls if c[0] == "SendMessage" and "reply_markup" in c[1]]
+    check("включённые кнопки оценки возвращаются одним переключателем",
           any("rate:77:" in str(c[1]["reply_markup"]) for c in sends), str(sends)[:200])
+    bot_module.RATING_BUTTONS_ENABLED = False
     check("классификация ушла в панель",
           any(path.endswith("/tickets/1/classify/") for path in paths), str(paths))
 

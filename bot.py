@@ -75,6 +75,12 @@ OUTBOX_INTERVAL = 2.5     # разбор исходящих из панели
 CONFIG_INTERVAL = 30      # опрос конфигурации
 HEARTBEAT_INTERVAL = 60   # сигнал «я жив»
 
+# Кнопки «Помогло / Не помогло» под ответами бота. Пока выключены по просьбе
+# заказчика — жителю они мешают. Код оценок никуда не делся: обработчик
+# нажатий, запись в карточку и показ в панели на месте, включить обратно —
+# поставить True.
+RATING_BUTTONS_ENABLED = False
+
 # Счётчики для сердцебиения: панель показывает их на странице настроек.
 COUNTERS = {"messages": 0, "answers": 0, "quick_answers": 0, "errors": 0}
 
@@ -598,7 +604,8 @@ async def _deliver_answer(message: Message, session, answer: str) -> None:
     crm_message_id = None
     if session.ticket_id:
         crm_message_id = await crm.ai_message(session.ticket_id, answer)
-    markup = rating_keyboard(crm_message_id) if crm_message_id else None
+    markup = (rating_keyboard(crm_message_id)
+              if crm_message_id and RATING_BUTTONS_ENABLED else None)
     await send_long(message, answer, reply_markup=markup)
 
 
