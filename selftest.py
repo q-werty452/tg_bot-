@@ -291,7 +291,7 @@ def test_storage() -> None:
     b = st.get(111)
     check("сессия одна на чат", a is b)
     check("у нового чата дефолтный провайдер", a.provider == "openai")
-    check("у нового чата развёрнутый режим", a.mode is Mode.DETAILED)
+    check("у нового чата диалоговый режим по умолчанию", a.mode is Mode.CHAT)
     st.get(222)
     check("сессии разных чатов не смешиваются", len(st) == 2, str(len(st)))
 
