@@ -15,8 +15,11 @@ __pycache__/
 
 # Логи
 bot.log*
+whatsapp_bot.log*
 
 # Связь с панелью управления
 crm_queue.jsonl
 crm_config_cache.json
+crm_config_cache_whatsapp.json
 incoming_media/
+README.md

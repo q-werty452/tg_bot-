@@ -16,8 +16,6 @@ bot.py — точка входа. Здесь живёт вся логика Tele
 import asyncio
 import contextlib
 import logging
-import logging.handlers
-import sys
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatAction
@@ -40,16 +38,15 @@ from aiogram.types import (
 
 from classify import classify_ticket
 from config import settings
+from conversation import ask_with_fallback, restore_history
 from crm import crm
 from icons import ICONS, clean_text
+from logging_setup import setup_logging
 from prompts import MAX_TOKENS, build_system
 from remote_config import remote
 from providers import (
     ProviderError,
     available_providers,
-    fallback_chain,
-    get_provider,
-    mark_unavailable,
     warm_up,
 )
 from storage import MODE_TITLES, PROVIDER_TITLES, Mode, Storage
@@ -127,6 +124,7 @@ def _profile(message: Message) -> dict:
     """Данные жителя для панели."""
     user = message.from_user
     return {
+        "channel": "telegram",
         "tg_user_id": user.id if user else message.chat.id,
         "chat_id": message.chat.id,
         "first_name": (user.first_name if user else "") or "",
@@ -362,58 +360,6 @@ async def switch_provider(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-# ------------------------------------------------- запрос к ИИ с подстраховкой
-
-async def ask_with_fallback(
-    preferred: str, system: str, history: list[dict], max_tokens: int, detailed: bool
-) -> tuple[str, str]:
-    """
-    Спросить модель, а если она подвела — незаметно переспросить у соседней.
-
-    Зачем: у бесплатных тарифов есть лимит запросов. Упереться в него посреди
-    показа или рабочего дня нельзя, поэтому при ошибке самого провайдера
-    (лимит, сеть, битый ключ) бот молча берёт следующую доступную модель.
-    Человек видит просто ответ, а в лог пишется, кто именно ответил.
-
-    Ошибки другого рода (сработал фильтр, ответ не влез в лимит длины)
-    не переигрываем: соседняя модель ответит так же (см. ProviderError.retryable).
-
-    Возвращает пару: текст ответа и имя модели, которая ответила.
-    """
-    chain = fallback_chain(preferred)
-    if not chain:
-        raise ProviderError("Не настроена ни одна модель. Проверь ключи в .env")
-
-    last_error: ProviderError | None = None
-
-    for name in chain:
-        try:
-            provider = get_provider(name)
-        except ProviderError as e:
-            # Нет ключа или не установлена библиотека — просто идём дальше.
-            last_error = e
-            continue
-
-        try:
-            answer = await provider.ask(
-                system=system, history=history, max_tokens=max_tokens, detailed=detailed
-            )
-        except ProviderError as e:
-            if not e.retryable:
-                raise  # виноват вопрос, а не провайдер — переспрашивать незачем
-            last_error = e
-            mark_unavailable(name)  # отставим на пару минут, чтобы не спотыкаться
-            logger.warning("Провайдер %s подвёл (%s), пробую следующего", name, e)
-            continue
-
-        if name != preferred:
-            logger.info("Ответ получен через запасную модель %s (вместо %s)", name, preferred)
-        return answer, name
-
-    # Все модели по очереди отказали.
-    raise last_error or ProviderError("Ни одна модель не ответила. Попробуй позже.")
-
-
 # --------------------------------------------------------- основной обработчик
 
 @dp.message(F.text)
@@ -500,7 +446,7 @@ async def respond(message: Message, bot: Bot, user_text: str,
     async with session.lock:
         # 3. После перезапуска бот ничего не помнит — поднимаем хвост
         #    переписки из панели, чтобы диалог продолжился, а не начался заново.
-        await _restore_history(session, message.chat.id)
+        await restore_history(session, message.chat.id, crm, settings.history_limit)
 
         # 4. Сообщение жителя уходит в карточку. Панель отвечает, кто ведёт
         #    диалог: ИИ или сотрудник. Панель лежит — обращение в очереди
@@ -609,27 +555,6 @@ async def _deliver_answer(message: Message, session, answer: str) -> None:
     await send_long(message, answer, reply_markup=markup)
 
 
-async def _restore_history(session, chat_id: int) -> None:
-    """Один раз за жизнь сессии подтянуть контекст диалога из панели."""
-    if session.restored or session.history or not crm.enabled:
-        session.restored = True
-        return
-    session.restored = True
-    context = await crm.context(chat_id)
-    if not context:
-        return
-    if context.get("is_open"):
-        session.ticket_id = context.get("ticket_id")
-    for item in context.get("messages") or []:
-        role = "user" if item.get("author") == "citizen" else "assistant"
-        text = (item.get("text") or "").strip()
-        if text:
-            session.add(role, text, settings.history_limit)
-    if session.history:
-        logger.info("Чат %s: восстановлено %s сообщений из панели",
-                    chat_id, len(session.history))
-
-
 @dp.callback_query(F.data.startswith("rate:"))
 async def rate_answer(callback: CallbackQuery) -> None:
     """Житель оценил ответ. Оценка уходит в карточку, кнопки убираются."""
@@ -679,30 +604,6 @@ async def on_error(event: ErrorEvent) -> bool:
 
 # ------------------------------------------------------------------- запуск
 
-def setup_logging() -> None:
-    """Логи одновременно в консоль и в файл bot.log (с ротацией)."""
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-    )
-
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(formatter)
-
-    # maxBytes/backupCount — чтобы файл логов не съел диск за полгода работы.
-    file_handler = logging.handlers.RotatingFileHandler(
-        "bot.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
-    )
-    file_handler.setFormatter(formatter)
-
-    root = logging.getLogger()
-    root.setLevel(settings.log_level if settings.log_level in
-                  ("DEBUG", "INFO", "WARNING", "ERROR") else "INFO")
-    root.handlers = [console, file_handler]
-
-    # aiohttp на уровне DEBUG заваливает лог служебными запросами.
-    logging.getLogger("aiogram.event").setLevel(logging.WARNING)
-
-
 async def set_commands(bot: Bot) -> None:
     """Список команд в меню Telegram (кнопка «/» рядом с полем ввода)."""
     await bot.set_my_commands([
@@ -724,7 +625,7 @@ async def outbox_loop(bot: Bot) -> None:
     while True:
         await asyncio.sleep(OUTBOX_INTERVAL)
         try:
-            items = await crm.outbox_pending()
+            items = await crm.outbox_pending(channel="telegram")
             for row in items:
                 try:
                     for chunk in split_text(row["text"]):
@@ -783,7 +684,7 @@ async def heartbeat_loop() -> None:
             from providers import is_available
             await crm.health(
                 providers={name: is_available(name) for name in available_providers()},
-                counters=dict(COUNTERS),
+                counters={**COUNTERS, "channel": "telegram"},
             )
         except asyncio.CancelledError:
             raise

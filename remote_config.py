@@ -18,9 +18,12 @@ CACHE_FILE = Path(__file__).parent / "crm_config_cache.json"
 
 
 class RemoteConfig:
-    def __init__(self) -> None:
+    def __init__(self, cache_file: Path | None = None) -> None:
         self.data: dict = {}
         self.version: int = -1
+        # Параметризуемо: whatsapp_bot.py использует свой файл кэша, чтобы
+        # два процесса не перетирали друг другу конфигурацию раз в 30 секунд.
+        self._cache_file = cache_file or CACHE_FILE
         self._load_cache()
 
     # ------------------------------------------------------------ свойства
@@ -113,17 +116,17 @@ class RemoteConfig:
 
     def _save_cache(self) -> None:
         try:
-            CACHE_FILE.write_text(
+            self._cache_file.write_text(
                 json.dumps(self.data, ensure_ascii=False, indent=1),
                 encoding="utf-8")
         except OSError:
             logger.exception("Не удалось сохранить кэш конфигурации")
 
     def _load_cache(self) -> None:
-        if not CACHE_FILE.exists():
+        if not self._cache_file.exists():
             return
         try:
-            self.data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            self.data = json.loads(self._cache_file.read_text(encoding="utf-8"))
             self.version = int(self.data.get("version") or 0)
         except (OSError, ValueError):
             logger.warning("Кэш конфигурации повреждён — начинаем с чистого")

@@ -43,6 +43,14 @@ class Settings:
     log_level: str
     crm_url: str
     crm_bot_token: str
+    # WhatsApp (Meta Cloud API) — используется только whatsapp_bot.py.
+    # Пусто — WhatsApp выключен, Telegram-бот продолжает работать как раньше.
+    meta_verify_token: str
+    meta_access_token: str
+    meta_app_secret: str
+    meta_phone_number_id: str
+    meta_graph_api_version: str
+    whatsapp_port: int
 
 
 def _env(name: str, default: str = "") -> str:
@@ -133,6 +141,14 @@ def load_settings() -> Settings:
         # Панель управления: пусто — бот работает автономно, без неё.
         crm_url=_env("CRM_URL"),
         crm_bot_token=_env("CRM_BOT_TOKEN"),
+        # WhatsApp: пусто — whatsapp_bot.py откажется запускаться понятной
+        # ошибкой, а этот (Telegram) бот WhatsApp вообще не касается.
+        meta_verify_token=_env("META_VERIFY_TOKEN"),
+        meta_access_token=_env("META_ACCESS_TOKEN"),
+        meta_app_secret=_env("META_APP_SECRET"),
+        meta_phone_number_id=_env("META_PHONE_NUMBER_ID"),
+        meta_graph_api_version=_env("META_GRAPH_API_VERSION") or "v21.0",
+        whatsapp_port=_env_int("WHATSAPP_PORT", 8081, minimum=1, maximum=65535),
     )
 
 

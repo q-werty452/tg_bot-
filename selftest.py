@@ -27,6 +27,10 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123456789:TESTTESTTESTTESTTESTTESTT
 os.environ.setdefault("OPENAI_API_KEY", "sk-test-selftest")
 os.environ.setdefault("GOOGLE_API_KEY", "AIzaTestSelftest")
 os.environ.setdefault("DEFAULT_PROVIDER", "openai")
+os.environ.setdefault("META_VERIFY_TOKEN", "test-verify-token")
+os.environ.setdefault("META_ACCESS_TOKEN", "test-access-token")
+os.environ.setdefault("META_APP_SECRET", "test-app-secret")
+os.environ.setdefault("META_PHONE_NUMBER_ID", "1234567890")
 
 PASSED: list[str] = []
 FAILED: list[tuple[str, str]] = []
@@ -450,6 +454,7 @@ async def test_dialog() -> None:
     section("5. Полный прогон диалога (aiogram)")
 
     import bot as bot_module
+    import conversation as conversation_module
     from aiogram import Bot
     from crm import crm as crm_client
     from providers import ProviderError
@@ -468,7 +473,7 @@ async def test_dialog() -> None:
     stub = StubProvider()
     stubs = {"openai": stub, "gemini": StubProvider(), "claude": StubProvider()}
     stubs["gemini"].answer = "Ответ Gemini."
-    bot_module.get_provider = lambda name: stubs[name]  # подменяем реальный вызов ИИ
+    conversation_module.get_provider = lambda name: stubs[name]  # подменяем реальный вызов ИИ
     dp = bot_module.dp
     storage = bot_module.storage
 
@@ -850,6 +855,10 @@ class FakePanel:
         self.config: dict = {"changed": True, "version": 7, "enabled": True,
                              "providers": [], "quick_answers": [], "facts": ""}
         self.context: dict | None = None
+        self.outbox_items: dict[str, list[dict]] = {
+            "telegram": [{"id": 5, "chat_id": 500, "text": "Ответ отдела ЖКХ", "kind": "reply"}],
+            "whatsapp": [],
+        }
 
     def handler(self, request):
         import httpx, json as _json
@@ -873,9 +882,8 @@ class FakePanel:
         if path.endswith("/config/"):
             return httpx.Response(200, json=self.config)
         if path.endswith("/outbox/"):
-            return httpx.Response(200, json={"items": [
-                {"id": 5, "chat_id": 500, "text": "Ответ отдела ЖКХ", "kind": "reply"},
-            ]})
+            channel = request.url.params.get("channel", "telegram")
+            return httpx.Response(200, json={"items": self.outbox_items.get(channel, [])})
         return httpx.Response(200, json={"ok": True})
 
 
@@ -928,9 +936,11 @@ async def test_crm_client() -> None:
     check("файл очереди удалён", not crm_module.QUEUE_FILE.exists())
 
     # Исходящие
-    items = await client.outbox_pending()
+    items = await client.outbox_pending(channel="telegram")
     check("исходящие разбираются", items and items[0]["text"] == "Ответ отдела ЖКХ",
           str(items))
+    empty = await client.outbox_pending(channel="whatsapp")
+    check("исходящие фильтруются по каналу", empty == [], str(empty))
     await client.outbox_sent(5)
     check("отправка помечена", any("/outbox/5/sent/" in path
                                    for _, path, _ in panel.requests))
@@ -950,6 +960,7 @@ async def test_dialog_with_panel() -> None:
     section("8. Диалог с подключённой панелью")
     import bot as bot_module
     import classify as classify_module
+    import conversation as conversation_module
     import json as _json
     from aiogram import Bot
     from remote_config import remote
@@ -961,7 +972,7 @@ async def test_dialog_with_panel() -> None:
     bot = Bot(token=os.environ["TELEGRAM_BOT_TOKEN"], session=fake.build_session())
     stub = StubProvider()
     stub.answer = "Мусор вывезут по графику."
-    bot_module.get_provider = lambda name: stub
+    conversation_module.get_provider = lambda name: stub
     classify_module.get_provider = lambda name: stub
     storage = bot_module.storage
     dp = bot_module.dp
@@ -1084,16 +1095,228 @@ async def test_dialog_with_panel() -> None:
 
 
 # ===========================================================================
+# 9. WhatsApp (whatsapp_bot.py) — подпись, разбор вебхука, приём, диалог,
+#    очередь исходящих. Отдельный процесс от Telegram-бота, но проверяется
+#    так же: без сети, без реальных ключей Meta.
+# ===========================================================================
+
+def test_whatsapp_pure() -> None:
+    section("9. WhatsApp: подпись и разбор вебхука (без сети)")
+    import hashlib
+    import hmac
+
+    import whatsapp_bot as wa
+
+    secret = "test-app-secret"
+    body = b'{"hello": "world"}'
+    good_sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    check("верная подпись принимается", wa.verify_signature(secret, body, good_sig))
+    check("испорченное тело отклоняется",
+          not wa.verify_signature(secret, b"tampered", good_sig))
+    check("чужой секрет отклоняется",
+          not wa.verify_signature("wrong-secret", body, good_sig))
+    check("без заголовка подписи — отказ", not wa.verify_signature(secret, body, None))
+    check("заголовок без префикса sha256= отклонён",
+          not wa.verify_signature(secret, body, good_sig.removeprefix("sha256=")))
+
+    payload = {"entry": [{"changes": [{"value": {
+        "contacts": [{"wa_id": "996700123456", "profile": {"name": "Айгуль"}}],
+        "messages": [{"from": "996700123456", "id": "wamid.1", "type": "text",
+                     "text": {"body": "Не работает свет"}}],
+    }}]}]}
+    parsed = wa.parse_webhook_payload(payload)
+    check("сообщение разобрано", len(parsed) == 1, str(parsed))
+    check("текст и имя на месте",
+          bool(parsed) and parsed[0]["text"] == "Не работает свет"
+          and parsed[0]["name"] == "Айгуль", str(parsed))
+
+    status_only = {"entry": [{"changes": [{"value": {
+        "statuses": [{"status": "delivered"}]}}]}]}
+    check("статус-колбэк без сообщений не роняет разбор",
+          wa.parse_webhook_payload(status_only) == [])
+    check("пустой payload не роняет разбор", wa.parse_webhook_payload({}) == [])
+
+    profile = wa.build_profile("996700123456", "Айгуль")
+    check("профиль WhatsApp собран правильно",
+          profile == {"channel": "whatsapp", "chat_id": 996700123456,
+                     "first_name": "Айгуль", "last_name": "", "username": "",
+                     "phone": "996700123456"},
+          str(profile))
+
+
+async def test_whatsapp_webhook() -> None:
+    section("10. WhatsApp: вебхук целиком (aiohttp, без сети)")
+    import hashlib
+    import hmac
+    import json as _json
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    import whatsapp_bot as wa
+
+    secret = "test-app-secret"
+    payload = {"entry": [{"changes": [{"value": {
+        "messages": [{"from": "996700123456", "id": "wamid.1", "type": "text",
+                     "text": {"body": "Вопрос"}}],
+    }}]}]}
+    body = _json.dumps(payload).encode()
+    good_sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+    app = web.Application()
+    app.router.add_get("/webhook", wa.verify_webhook)
+    app.router.add_post("/webhook", wa.receive_webhook)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        r = await client.get("/webhook", params={
+            "hub.mode": "subscribe", "hub.verify_token": "test-verify-token",
+            "hub.challenge": "12345"})
+        check("хендшейк отвечает challenge",
+              r.status == 200 and await r.text() == "12345")
+
+        r = await client.get("/webhook", params={
+            "hub.mode": "subscribe", "hub.verify_token": "чужой-токен",
+            "hub.challenge": "12345"})
+        check("хендшейк с неверным токеном отклонён (403)", r.status == 403)
+
+        received: list[dict] = []
+        original = wa.handle_incoming_message
+
+        async def fake_handle(msg):
+            received.append(msg)
+
+        wa.handle_incoming_message = fake_handle
+        try:
+            r = await client.post("/webhook", data=body, headers={
+                "X-Hub-Signature-256": good_sig, "Content-Type": "application/json"})
+            check("приём с верной подписью -> 200", r.status == 200)
+            await asyncio.sleep(0.05)
+            check("сообщение дошло до обработчика", len(received) == 1, str(received))
+
+            received.clear()
+            r = await client.post("/webhook", data=body, headers={
+                "X-Hub-Signature-256": "sha256=" + "0" * 64,
+                "Content-Type": "application/json"})
+            check("приём с неверной подписью -> 403", r.status == 403)
+            await asyncio.sleep(0.05)
+            check("обработчик не вызван при неверной подписи", received == [])
+        finally:
+            wa.handle_incoming_message = original
+    finally:
+        await client.close()
+
+
+async def test_whatsapp_dialog_with_panel() -> None:
+    section("11. WhatsApp: диалог с подключённой панелью")
+    import conversation as conversation_module
+    import whatsapp_bot as wa
+
+    panel = FakePanel()
+    client = connect_fake_panel(panel)
+
+    stub = StubProvider()
+    stub.answer = "Заявку приняли, разберёмся."
+    conversation_module.get_provider = lambda name: stub
+
+    sent: list[tuple[str, str]] = []
+
+    async def fake_send(phone, text):
+        sent.append((phone, text))
+        return True, ""
+
+    wa.send_whatsapp_text = fake_send
+
+    chat_id = 996700123456
+    wa.storage.get(chat_id).clear()
+    wa.storage.get(chat_id).restored = True  # без сети до контекста, как в тесте 8
+    panel.requests.clear()
+    await wa.handle_incoming_message({"phone": str(chat_id), "type": "text",
+                                      "text": "Не вывозят мусор", "wa_message_id": "w1",
+                                      "name": "Айгуль"})
+    paths = [path for _, path, _ in panel.requests]
+    check("обращение записано в панель (WhatsApp)",
+          "/tickets/incoming/" in " ".join(paths), str(paths))
+    check("канал в обращении — whatsapp",
+          any(b"whatsapp" in body for _, path, body in panel.requests
+              if path.endswith("/tickets/incoming/")))
+    check("ответ ИИ записан в карточку (WhatsApp)",
+          any(p.endswith("/tickets/1/messages/") for p in paths), str(paths))
+    check("ответ отправлен через WhatsApp",
+          bool(sent) and sent[-1] == (str(chat_id), stub.answer), str(sent))
+
+    # режим сотрудника — ИИ молчит, ответ уйдёт только через очередь исходящих
+    panel.answer_mode = "staff"
+    sent.clear()
+    await wa.handle_incoming_message({"phone": str(chat_id), "type": "text",
+                                      "text": "ещё вопрос", "wa_message_id": "w2", "name": ""})
+    check("в режиме сотрудника WhatsApp-бот не отвечает сам", sent == [], str(sent))
+    panel.answer_mode = "ai"
+
+    # не текстовое сообщение — заглушка, обращение в панель не уходит
+    panel.requests.clear()
+    sent.clear()
+    await wa.handle_incoming_message({"phone": str(chat_id), "type": "image",
+                                      "text": "", "wa_message_id": "w3", "name": ""})
+    check("не-текстовое сообщение не создаёт обращение", panel.requests == [])
+    check("на не-текстовое сообщение есть ответ-заглушка", bool(sent), str(sent))
+
+    await client.close()
+
+
+async def test_whatsapp_outbox() -> None:
+    section("12. WhatsApp: очередь исходящих")
+    import whatsapp_bot as wa
+
+    panel = FakePanel()
+    client = connect_fake_panel(panel)
+    panel.outbox_items["telegram"] = []
+    panel.outbox_items["whatsapp"] = [
+        {"id": 9, "chat_id": 996700123456, "text": "Ответ по вашей заявке", "kind": "reply"},
+    ]
+
+    sent: list[tuple[str, str]] = []
+
+    async def fake_send(phone, text):
+        sent.append((phone, text))
+        return True, ""
+
+    wa.send_whatsapp_text = fake_send
+
+    items = await client.outbox_pending(channel="whatsapp")
+    check("WhatsApp-очередь отдаёт свою строку", bool(items) and items[0]["id"] == 9,
+          str(items))
+    check("Telegram-очередь не видит WhatsApp-строку",
+          await client.outbox_pending(channel="telegram") == [])
+
+    for row in items:
+        ok, error = await wa.send_whatsapp_text(str(row["chat_id"]), row["text"])
+        if ok:
+            await client.outbox_sent(row["id"])
+        else:
+            await client.outbox_failed(row["id"], error)
+    check("строка отправлена через WhatsApp",
+          sent == [("996700123456", "Ответ по вашей заявке")], str(sent))
+    check("строка помечена отправленной в панели",
+          any("/outbox/9/sent/" in p for _, p, _ in panel.requests))
+
+    await client.close()
+
+
+# ===========================================================================
 
 async def main() -> int:
-    for test in (test_config, test_split, test_icons, test_prompts, test_storage):
+    for test in (test_config, test_split, test_icons, test_prompts, test_storage,
+                 test_whatsapp_pure):
         try:
             test()
         except Exception:
             FAILED.append((test.__name__, traceback.format_exc()))
 
     for test in (test_dialog, test_providers_offline,
-                 test_crm_client, test_dialog_with_panel):
+                 test_crm_client, test_dialog_with_panel,
+                 test_whatsapp_webhook, test_whatsapp_dialog_with_panel,
+                 test_whatsapp_outbox):
         try:
             await test()
         except Exception:

@@ -119,24 +119,29 @@ class CRM:
             "POST", f"/messages/{message_id}/rating/", json={"rating": value})
         return result is not None
 
-    async def context(self, chat_id: int) -> dict | None:
+    async def context(self, chat_id: int, channel: str = "telegram") -> dict | None:
         """История диалога после перезапуска бота."""
-        return await self._request("GET", f"/chats/{chat_id}/context/")
+        return await self._request(
+            "GET", f"/chats/{chat_id}/context/", params={"channel": channel})
 
-    async def close_chat(self, chat_id: int) -> None:
-        await self._request("POST", f"/chats/{chat_id}/close/")
+    async def close_chat(self, chat_id: int, channel: str = "telegram") -> None:
+        await self._request(
+            "POST", f"/chats/{chat_id}/close/", json={"channel": channel})
 
-    async def subscription(self, chat_id: int, subscribed: bool) -> None:
+    async def subscription(self, chat_id: int, subscribed: bool,
+                           channel: str = "telegram") -> None:
         await self._request("POST", "/citizens/subscription/",
-                            json={"chat_id": chat_id, "subscribed": subscribed})
+                            json={"chat_id": chat_id, "subscribed": subscribed,
+                                  "channel": channel})
 
     async def answer_hit(self, answer_id: int) -> None:
         await self._request("POST", f"/answers/{answer_id}/hit/")
 
     # ------------------------------------------------------------ исходящие
 
-    async def outbox_pending(self, limit: int = 50) -> list[dict]:
-        result = await self._request("GET", "/outbox/", params={"limit": limit})
+    async def outbox_pending(self, channel: str, limit: int = 50) -> list[dict]:
+        result = await self._request(
+            "GET", "/outbox/", params={"limit": limit, "channel": channel})
         return (result or {}).get("items", [])
 
     async def outbox_sent(self, row_id: int) -> None:
