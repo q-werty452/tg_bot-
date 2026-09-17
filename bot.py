@@ -36,7 +36,7 @@ from aiogram.types import (
     Message,
 )
 
-from classify import classify_ticket
+from classify import classify_ticket, refine_ticket
 from config import settings
 from conversation import ask_with_fallback, restore_history
 from crm import crm
@@ -463,6 +463,10 @@ async def respond(message: Message, bot: Bot, user_text: str,
                 # Новая карточка — фоново определяем тему. Ответа не ждём.
                 asyncio.create_task(classify_ticket(
                     crm, session.ticket_id, user_text, session.provider))
+                # И ещё раз, через несколько минут — по уже сложившейся
+                # переписке (заголовок и адрес/район), а не по одной фразе «привет».
+                asyncio.create_task(refine_ticket(
+                    crm, session.ticket_id, session.provider))
             if record.get("answer_mode") == "staff":
                 # Разговор перехватил сотрудник: ИИ молчит, ответ придёт
                 # через очередь исходящих. Историю ИИ не трогаем.

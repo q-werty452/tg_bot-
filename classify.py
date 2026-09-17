@@ -112,3 +112,95 @@ async def classify_ticket(crm, ticket_id: int, text: str,
         result = _fallback(text)
 
     await crm.classify(ticket_id, result)
+
+
+# ------------------------------------------------------- доводка позже
+
+# И заголовок, и адрес/район при создании заявки ставятся по одной фразе
+# («Привет» — и всё, адреса там обычно ещё нет), поэтому через некоторое
+# время смотрим на уже сложившуюся переписку и дозаполняем то, что стало
+# известно позже. Заголовок при этом перезаписывается принудительно (ровно
+# один раз — дальше панель сама не даст сработать повторно, см. RetitleView
+# в manas-crm), а адрес/район/категория — как обычно, только если ещё
+# пустые (см. ClassifyView, чтобы не затирать правки сотрудника).
+RETITLE_DELAY_SECONDS = 300
+
+RETITLE_PROMPT = """\
+Определи короткую тему обращения жителя в мэрию города Манас (Кыргызстан) по
+всей переписке ниже. Ответь СТРОГО одной строкой — суть в 3-7 слов, на языке
+обращения, без кавычек и пояснений. Если по переписке до сих пор не ясно, о
+чём вообще речь (например, житель просто поздоровался и ничего не спросил),
+ответь ровно словом: НЕЯСНО
+"""
+
+
+async def refine_ticket(crm, ticket_id: int, provider_name: str,
+                        delay: float = RETITLE_DELAY_SECONDS) -> None:
+    """
+    Фоновая задача: подождать, затем досмотреть всю переписку и дозаполнить
+    заголовок и адрес/район/категорию, если раньше по одной фразе их было
+    не определить.
+
+    Как и classify_ticket — никогда не мешает ответу жителю (отдельная
+    задача, свой таймаут) и не падает при сбое сети или модели: заявка
+    просто остаётся как есть.
+    """
+    await asyncio.sleep(delay)
+
+    history = await crm.history(ticket_id, limit=30)
+    if not history or not history.get("messages"):
+        return
+    conversation = "\n".join(
+        f"{m['author']}: {m['text']}" for m in history["messages"] if m.get("text")
+    ).strip()
+    if not conversation:
+        return
+
+    try:
+        provider = get_provider(provider_name)
+    except ProviderError:
+        return
+
+    # Заголовок — отдельным, узким запросом: тут нужна короткая фраза,
+    # а не JSON с категорией и районом.
+    try:
+        raw_title = await asyncio.wait_for(
+            provider.ask(system=RETITLE_PROMPT,
+                         history=[{"role": "user", "content": conversation[:4000]}],
+                         max_tokens=60, detailed=False),
+            timeout=30,
+        )
+        title = raw_title.strip().strip('"').strip("«»").strip()
+        if title and title.upper() != "НЕЯСНО":
+            await crm.retitle(ticket_id, title[:200])
+    except (ProviderError, asyncio.TimeoutError) as e:
+        logger.info("Уточнение темы не удалось (%s) — пропуск", e)
+    except Exception:
+        logger.exception("Неожиданная ошибка при уточнении темы")
+
+    # Адрес/район/категория — тем же промптом и разбором, что и при
+    # создании заявки, только по всей переписке, а не по первой фразе.
+    categories = remote.categories or FALLBACK_CATEGORIES
+    districts = remote.districts
+    prompt = PROMPT.format(
+        categories=", ".join(f'{c["slug"]} ({c["name"]})' for c in categories),
+        districts=", ".join(f'{d["slug"]} ({d["name"]})' for d in districts)
+                  or "нет данных",
+    )
+    try:
+        raw = await asyncio.wait_for(
+            provider.ask(system=prompt,
+                         history=[{"role": "user", "content": conversation[:4000]}],
+                         max_tokens=300, detailed=False),
+            timeout=45,
+        )
+        result = parse_answer(raw, {c["slug"] for c in categories},
+                              {d["slug"] for d in districts}, conversation)
+    except (ProviderError, asyncio.TimeoutError) as e:
+        logger.info("Повторная классификация не удалась (%s) — пропуск", e)
+        return
+    except Exception:
+        logger.exception("Неожиданная ошибка повторной классификации")
+        return
+
+    await crm.classify(ticket_id, result)

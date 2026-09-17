@@ -114,6 +114,16 @@ class CRM:
     async def classify(self, ticket_id: int, data: dict) -> None:
         await self._request("POST", f"/tickets/{ticket_id}/classify/", json=data)
 
+    async def retitle(self, ticket_id: int, title: str) -> bool:
+        """Разовое уточнение темы заявки по всей переписке (см. classify.py)."""
+        result = await self._request(
+            "POST", f"/tickets/{ticket_id}/retitle/", json={"title": title})
+        return bool(result and result.get("applied"))
+
+    async def history(self, ticket_id: int, limit: int = 30) -> dict | None:
+        return await self._request(
+            "GET", f"/tickets/{ticket_id}/history/", params={"limit": limit})
+
     async def rating(self, message_id: int, value: str) -> bool:
         result = await self._request(
             "POST", f"/messages/{message_id}/rating/", json={"rating": value})

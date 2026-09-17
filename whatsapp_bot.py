@@ -35,7 +35,7 @@ from typing import Any
 import httpx
 from aiohttp import web
 
-from classify import classify_ticket
+from classify import classify_ticket, refine_ticket
 from config import settings
 from conversation import ask_with_fallback, restore_history
 from crm import crm
@@ -300,6 +300,8 @@ async def respond(msg: dict, phone: str, user_text: str,
             if record.get("created") and session.ticket_id:
                 asyncio.create_task(classify_ticket(
                     crm, session.ticket_id, user_text, session.provider))
+                asyncio.create_task(refine_ticket(
+                    crm, session.ticket_id, session.provider))
             if record.get("answer_mode") == "staff":
                 # Разговор перехватил сотрудник — ответ уйдёт через очередь
                 # исходящих (см. outbox_send_loop), ИИ здесь молчит.

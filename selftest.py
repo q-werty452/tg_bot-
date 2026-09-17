@@ -859,6 +859,9 @@ class FakePanel:
             "telegram": [{"id": 5, "chat_id": 500, "text": "Ответ отдела ЖКХ", "kind": "reply"}],
             "whatsapp": [],
         }
+        self.history_messages: list[dict] = []
+        self.retitled = False
+        self.retitle_calls: list[str] = []
 
     def handler(self, request):
         import httpx, json as _json
@@ -879,6 +882,15 @@ class FakePanel:
             if self.context is None:
                 return httpx.Response(404, json={"detail": "нет"})
             return httpx.Response(200, json=self.context)
+        if path.endswith("/history/"):
+            return httpx.Response(200, json={"ticket_id": self.ticket_id,
+                                             "messages": self.history_messages})
+        if path.endswith("/retitle/"):
+            body = _json.loads(request.content or b"{}")
+            applied = not self.retitled
+            self.retitled = self.retitled or applied
+            self.retitle_calls.append(body.get("title"))
+            return httpx.Response(200, json={"applied": applied})
         if path.endswith("/config/"):
             return httpx.Response(200, json=self.config)
         if path.endswith("/outbox/"):
@@ -1303,6 +1315,83 @@ async def test_whatsapp_outbox() -> None:
     await client.close()
 
 
+class SequencedStub:
+    """Подставной ИИ, отвечающий по очереди из списка — для проверки двух
+    последовательных запросов внутри одной фоновой задачи (заголовок,
+    затем категория/район/адрес)."""
+
+    def __init__(self, answers: list[str]):
+        self.answers = list(answers)
+        self.systems: list[str] = []
+
+    async def ask(self, system, history, max_tokens, detailed):
+        self.systems.append(system)
+        return self.answers.pop(0) if self.answers else "НЕЯСНО"
+
+
+async def test_retitle() -> None:
+    section("13. Доводка заявки по переписке (classify.refine_ticket)")
+    import json as _json
+
+    import classify as classify_module
+    from providers import ProviderError
+
+    panel = FakePanel()
+    client = connect_fake_panel(panel)
+
+    stub = SequencedStub([])
+    classify_module.get_provider = lambda name: stub
+
+    panel.history_messages = []
+    await classify_module.refine_ticket(client, 1, "openai", delay=0)
+    check("без истории заголовок не трогается", panel.retitle_calls == [],
+          str(panel.retitle_calls))
+
+    panel.history_messages = [
+        {"author": "citizen", "text": "Привет, течёт труба во дворе"},
+        {"author": "ai", "text": "Напишите адрес, передам в ЖКХ"},
+        {"author": "citizen", "text": "Ул. Ленина 5"},
+    ]
+
+    # заголовок понятен, адрес — из переписки, не из первой фразы
+    stub.answers = [
+        "Течёт труба во дворе",
+        '{"title": "x", "category": "utilities", "district": "", "address": "Ул. Ленина 5"}',
+    ]
+    panel.requests.clear()
+    await classify_module.refine_ticket(client, 1, "openai", delay=0)
+    check("заголовок отправлен", panel.retitle_calls == ["Течёт труба во дворе"],
+          str(panel.retitle_calls))
+    classify_body = next(
+        (_json.loads(body) for _, p, body in panel.requests if p.endswith("/classify/")), None)
+    check("запрос на классификацию по всей переписке дошёл", classify_body is not None)
+    check("адрес из переписки попал в запрос",
+          bool(classify_body) and classify_body.get("address") == "Ул. Ленина 5",
+          str(classify_body))
+
+    # модель не поняла тему — заголовок не трогаем, классификацию всё равно пробуем
+    panel.retitle_calls.clear()
+    stub.answers = ["НЕЯСНО", '{"title": "x", "category": "other", "district": "", "address": ""}']
+    await classify_module.refine_ticket(client, 1, "openai", delay=0)
+    check("НЕЯСНО не уходит в панель", panel.retitle_calls == [], str(panel.retitle_calls))
+
+    # сбой модели на этапе классификации не роняет задачу
+    stub.answers = ["Тема"]
+
+    async def broken_ask(*a, **kw):
+        raise ProviderError("временная ошибка")
+
+    stub.ask = broken_ask
+    try:
+        await classify_module.refine_ticket(client, 1, "openai", delay=0)
+        ok = True
+    except Exception:
+        ok = False
+    check("сбой модели не роняет фоновую задачу", ok)
+
+    await client.close()
+
+
 # ===========================================================================
 
 async def main() -> int:
@@ -1316,7 +1405,7 @@ async def main() -> int:
     for test in (test_dialog, test_providers_offline,
                  test_crm_client, test_dialog_with_panel,
                  test_whatsapp_webhook, test_whatsapp_dialog_with_panel,
-                 test_whatsapp_outbox):
+                 test_whatsapp_outbox, test_retitle):
         try:
             await test()
         except Exception:
