@@ -16,6 +16,7 @@ __pycache__/
 # Логи
 bot.log*
 whatsapp_bot.log*
+*_run.log
 
 # Связь с панелью управления
 crm_queue.jsonl
