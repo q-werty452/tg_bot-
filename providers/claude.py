@@ -14,6 +14,8 @@ providers/claude.py — работа с Claude через официальный
    thinking={"type": "adaptive"} — модель сама решает, сколько думать.
 """
 
+import base64
+
 from anthropic import (
     APIConnectionError,
     APIStatusError,
@@ -25,6 +27,34 @@ from anthropic import (
 
 from config import settings
 from providers.base import LLMProvider, ProviderError
+from utils import read_image
+
+
+def _to_message(item: dict) -> dict:
+    """Перевод сообщения в формат Anthropic — с фото content становится списком блоков."""
+    images = item.get("images")
+    if not images:
+        return {"role": item["role"], "content": item["content"]}
+
+    blocks: list[dict] = []
+    if item["content"]:
+        blocks.append({"type": "text", "text": item["content"]})
+    for path in images:
+        encoded = read_image(path)
+        if encoded is None:
+            continue
+        mime, data = encoded
+        blocks.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": mime,
+                "data": base64.b64encode(data).decode("ascii"),
+            },
+        })
+    if not blocks:
+        blocks = [{"type": "text", "text": item["content"] or ""}]
+    return {"role": item["role"], "content": blocks}
 
 
 class ClaudeProvider(LLMProvider):
@@ -58,7 +88,7 @@ class ClaudeProvider(LLMProvider):
             "model": self._model,
             "max_tokens": max_tokens,
             "system": system,      # <- отдельным полем, не в messages
-            "messages": history,
+            "messages": [_to_message(item) for item in history],
         }
 
         if detailed:

@@ -15,6 +15,7 @@ providers/openai_provider.py — работа с GPT через официаль
 иначе Python при import openai нашёл бы наш файл вместо библиотеки.
 """
 
+import base64
 import logging
 
 from openai import (
@@ -30,8 +31,40 @@ from openai import (
 
 from config import settings
 from providers.base import LLMProvider, ProviderError
+from utils import read_image
 
 logger = logging.getLogger(__name__)
+
+
+def _to_message(item: dict) -> dict:
+    """
+    Перевести одно сообщение нашей истории в формат OpenAI.
+
+    Без фото — как раньше, content простой строкой. С фото — content
+    становится списком блоков (текст + image_url с картинкой как data:
+    URL): так GPT/OpenRouter-модели с поддержкой vision реально видят,
+    что на фото, а не только читают текстовую пометку о нём.
+    """
+    images = item.get("images")
+    if not images:
+        return {"role": item["role"], "content": item["content"]}
+
+    parts: list[dict] = []
+    if item["content"]:
+        parts.append({"type": "text", "text": item["content"]})
+    for path in images:
+        encoded = read_image(path)
+        if encoded is None:
+            continue
+        mime, data = encoded
+        b64 = base64.b64encode(data).decode("ascii")
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{b64}"},
+        })
+    if not parts:
+        parts = [{"type": "text", "text": item["content"] or ""}]
+    return {"role": item["role"], "content": parts}
 
 
 class OpenAIProvider(LLMProvider):
@@ -74,7 +107,7 @@ class OpenAIProvider(LLMProvider):
         detailed: bool,
     ) -> str:
         # Системный промпт идёт первым сообщением, дальше — вся история.
-        messages = [{"role": "system", "content": system}, *history]
+        messages = [{"role": "system", "content": system}, *(_to_message(h) for h in history)]
 
         try:
             try:

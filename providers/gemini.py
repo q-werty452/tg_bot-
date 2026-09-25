@@ -20,6 +20,7 @@ from google.genai import types
 
 from config import settings
 from providers.base import LLMProvider, ProviderError
+from utils import read_image
 
 logger = logging.getLogger(__name__)
 
@@ -74,17 +75,32 @@ class GeminiProvider(LLMProvider):
         Было:  {"role": "assistant", "content": "текст"}
         Стало: Content(role="model", parts=[Part(text="текст")])
 
+        Сообщение с фото (item["images"]) получает дополнительный
+        Part.from_bytes на каждую картинку — так Gemini реально видит,
+        что на фото, а не только читает текстовую пометку о нём.
+
         Именно поэтому мы храним историю в нейтральном формате (см. storage.py):
         каждый провайдер конвертирует её под себя, и переключение модели
         посреди диалога ничего не ломает.
         """
-        return [
-            types.Content(
+        contents = []
+        for item in history:
+            parts: list[types.Part] = []
+            if item["content"]:
+                parts.append(types.Part(text=item["content"]))
+            for path in item.get("images") or []:
+                encoded = read_image(path)
+                if encoded is None:
+                    continue
+                mime, data = encoded
+                parts.append(types.Part.from_bytes(data=data, mime_type=mime))
+            if not parts:
+                parts = [types.Part(text="")]
+            contents.append(types.Content(
                 role="model" if item["role"] == "assistant" else "user",
-                parts=[types.Part(text=item["content"])],
-            )
-            for item in history
-        ]
+                parts=parts,
+            ))
+        return contents
 
     def _build_config(
         self, system: str, max_tokens: int, variant: str | None
