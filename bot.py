@@ -376,8 +376,10 @@ async def handle_media(message: Message, bot: Bot) -> None:
     Фотография или документ от жителя.
 
     Файл скачивается и уходит в панель вместе с подписью — отдел увидит его
-    в карточке. Модель картинку не видит, поэтому для ответа ИИ подпись
-    дополняется пометкой, что приложено фото.
+    в карточке. Настоящее фото (message.photo) отправляется модели ещё и как
+    vision-вложение (см. image_paths ниже) — она реально его видит, не
+    только читает текстовую пометку о нём. Документ (PDF, скан и т.п.)
+    остаётся только вложением карточки.
     """
     caption = (message.caption or "").strip()
 
@@ -409,18 +411,24 @@ async def handle_media(message: Message, bot: Bot) -> None:
     model_text = caption or "Житель прислал фотографию без подписи."
     if caption:
         model_text = f"[Житель приложил фотографию] {caption}"
+    # Модели показываем только настоящее фото — документ (PDF, скан и т.п.)
+    # остаётся вложением к карточке, но не становится vision-запросом.
+    image_paths = [str(path)] if message.photo else None
     await respond(message, bot, model_text,
-                  file_paths=[str(path)], citizen_text=caption)
+                  file_paths=[str(path)], citizen_text=caption, image_paths=image_paths)
 
 
 async def respond(message: Message, bot: Bot, user_text: str,
                   file_paths: list[str] | None = None,
-                  citizen_text: str | None = None) -> None:
+                  citizen_text: str | None = None,
+                  image_paths: list[str] | None = None) -> None:
     """
     Общий путь любого обращения: панель -> (готовый ответ | модель) -> житель.
 
     citizen_text — что записать в карточку как сообщение жителя, если оно
     отличается от текста для модели (случай фотографии).
+    image_paths — пути к фото, которые нужно реально показать модели
+    (vision), а не просто прикрепить к карточке (см. file_paths).
     """
     session = storage.get(message.chat.id)
     COUNTERS["messages"] += 1
@@ -477,7 +485,7 @@ async def respond(message: Message, bot: Bot, user_text: str,
         if quick:
             COUNTERS["quick_answers"] += 1
             answer = quick["answer"]
-            session.add("user", user_text, settings.history_limit)
+            session.add("user", user_text, settings.history_limit, images=image_paths)
             session.add("assistant", answer, settings.history_limit)
             if quick.get("id"):
                 asyncio.create_task(crm.answer_hit(quick["id"]))
@@ -486,7 +494,7 @@ async def respond(message: Message, bot: Bot, user_text: str,
 
         # 6. Кладём вопрос в историю и спрашиваем модель. Промпт собирается
         #    из данных панели: тексты, справочник контактов, режим фактов.
-        session.add("user", user_text, settings.history_limit)
+        session.add("user", user_text, settings.history_limit, images=image_paths)
 
         detailed = session.mode is Mode.DETAILED
         system = build_system(

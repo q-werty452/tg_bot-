@@ -18,8 +18,10 @@ Telegram, статус «печатает», разбиение через messa
 
 Фото и документы принимаются (см. download_whatsapp_media): скачиваются по
 двухшаговому протоколу Meta (media_id -> временная ссылка -> файл) и уходят
-в панель как вложение — аналогично bot.py:handle_media() для Telegram. Голос,
-видео, стикеры, локация и т.п. — фиксированный ответ, обращение не заводится.
+в панель как вложение — аналогично bot.py:handle_media() для Telegram. Фото
+(type="image") дополнительно уходит модели как vision-вложение — она его
+реально видит. Голос, видео, стикеры, локация и т.п. — фиксированный ответ,
+обращение не заводится.
 """
 
 import asyncio
@@ -257,7 +259,12 @@ async def handle_incoming_message(msg: dict) -> None:
         model_text = caption or f"Житель прислал {label} без подписи."
         if caption:
             model_text = f"[Житель приложил {label}] {caption}"
-        await respond(msg, phone, model_text, file_paths=[str(path)], citizen_text=caption)
+        # Саму картинку модели показываем только для type="image" — документ
+        # (PDF, скан и т.п.) остаётся вложением к карточке, но не превращается
+        # в vision-запрос: разбирать содержимое произвольных файлов не наша задача.
+        image_paths = [str(path)] if msg["type"] == "image" else None
+        await respond(msg, phone, model_text, file_paths=[str(path)],
+                     citizen_text=caption, image_paths=image_paths)
         return
 
     await send_whatsapp_text(
@@ -267,12 +274,15 @@ async def handle_incoming_message(msg: dict) -> None:
 
 async def respond(msg: dict, phone: str, user_text: str,
                   file_paths: list[str] | None = None,
-                  citizen_text: str | None = None) -> None:
+                  citizen_text: str | None = None,
+                  image_paths: list[str] | None = None) -> None:
     """
     Общий путь любого обращения WhatsApp — аналог respond() из bot.py.
 
     citizen_text — что записать в карточку как сообщение жителя, если оно
     отличается от текста для модели (случай фото/документа с подписью или без).
+    image_paths — пути к фото, которые нужно реально показать модели
+    (vision), а не просто прикрепить к карточке (см. file_paths).
     """
     chat_id = int(phone)
     session = storage.get(chat_id)
@@ -311,14 +321,14 @@ async def respond(msg: dict, phone: str, user_text: str,
         if quick:
             COUNTERS["quick_answers"] += 1
             answer = quick["answer"]
-            session.add("user", user_text, settings.history_limit)
+            session.add("user", user_text, settings.history_limit, images=image_paths)
             session.add("assistant", answer, settings.history_limit)
             if quick.get("id"):
                 asyncio.create_task(crm.answer_hit(quick["id"]))
             await _deliver_answer(phone, session, answer)
             return
 
-        session.add("user", user_text, settings.history_limit)
+        session.add("user", user_text, settings.history_limit, images=image_paths)
 
         detailed = session.mode is Mode.DETAILED
         system = build_system(
