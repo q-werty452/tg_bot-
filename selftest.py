@@ -301,6 +301,94 @@ def test_storage() -> None:
     check("старая сессия убрана", removed == 1 and len(st) == 1, f"removed={removed}, len={len(st)}")
 
 
+def test_vision_pure() -> None:
+    section("4b. Фото для модели (utils.read_image + сборка сообщений)")
+    import base64
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    from utils import VISION_IMAGE_LIMIT, read_image
+
+    # Валидный 1x1 PNG — реального декодирования картинки нам не нужно,
+    # важно только что read_image() честно вернёт байты и mime.
+    png_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY"
+        "42YAAAAASUVORK5CYII="
+    )
+    tmpdir = Path(tempfile.mkdtemp(prefix="selftest_vision_"))
+    try:
+        good_path = tmpdir / "photo.png"
+        good_path.write_bytes(png_bytes)
+
+        encoded = read_image(str(good_path))
+        check("read_image читает валидную картинку", encoded is not None)
+        check("read_image возвращает верный mime",
+              encoded is not None and encoded[0] == "image/png", str(encoded and encoded[0]))
+        check("read_image возвращает те же байты",
+              encoded is not None and encoded[1] == png_bytes)
+
+        check("read_image: нет файла -> None",
+              read_image(str(tmpdir / "нет-такого.png")) is None)
+
+        doc_path = tmpdir / "doc.pdf"
+        doc_path.write_bytes(b"%PDF-1.4 fake")
+        check("read_image: не картинка по расширению -> None", read_image(str(doc_path)) is None)
+
+        big_path = tmpdir / "big.jpg"
+        big_path.write_bytes(b"\xff" * (VISION_IMAGE_LIMIT + 1))
+        check("read_image: слишком большой файл -> None", read_image(str(big_path)) is None)
+
+        # storage.Session.add сохраняет пути к фото в истории
+        from storage import Session
+        s = Session(provider="openai")
+        s.add("user", "текст", limit=10, images=[str(good_path)])
+        check("Session.add сохраняет images", s.history[-1].get("images") == [str(good_path)])
+        s.add("user", "без фото", limit=10)
+        check("Session.add без фото не добавляет ключ", "images" not in s.history[-1])
+
+        # Сборка сообщения для OpenAI (и OpenRouter — тот же код, он наследует ask())
+        from providers.openai_provider import _to_message as openai_to_message
+        plain = openai_to_message({"role": "user", "content": "просто текст"})
+        check("openai: без фото content остаётся строкой", plain["content"] == "просто текст")
+
+        with_photo = openai_to_message(
+            {"role": "user", "content": "подпись", "images": [str(good_path)]})
+        check("openai: с фото content становится списком блоков",
+              isinstance(with_photo["content"], list))
+        kinds = [b["type"] for b in with_photo["content"]]
+        check("openai: есть текстовый и image_url блоки", kinds == ["text", "image_url"], str(kinds))
+        check("openai: картинка закодирована как data: URL с верным mime",
+              with_photo["content"][1]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+        missing_photo = openai_to_message(
+            {"role": "user", "content": "подпись", "images": [str(tmpdir / "нет.png")]})
+        check("openai: несуществующее фото не роняет сборку, остаётся текст",
+              missing_photo["content"] == [{"type": "text", "text": "подпись"}],
+              str(missing_photo["content"]))
+
+        # Сборка истории для Gemini
+        from providers.gemini import GeminiProvider
+        hist = GeminiProvider._to_gemini_history(
+            [{"role": "user", "content": "подпись", "images": [str(good_path)]}])
+        check("gemini: у сообщения с фото два part (текст + картинка)",
+              len(hist[0].parts) == 2, str(len(hist[0].parts)))
+        check("gemini: картинка передана как inline_data с верным mime",
+              hist[0].parts[1].inline_data.mime_type == "image/png")
+
+        # Сборка сообщения для Claude
+        from providers.claude import _to_message as claude_to_message
+        claude_with_photo = claude_to_message(
+            {"role": "user", "content": "подпись", "images": [str(good_path)]})
+        check("claude: content становится списком блоков с фото",
+              isinstance(claude_with_photo["content"], list)
+              and claude_with_photo["content"][1]["type"] == "image")
+        check("claude: media_type верный",
+              claude_with_photo["content"][1]["source"]["media_type"] == "image/png")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ===========================================================================
 # 5. Полный прогон диалога через aiogram
 # ===========================================================================
@@ -1396,7 +1484,7 @@ async def test_retitle() -> None:
 
 async def main() -> int:
     for test in (test_config, test_split, test_icons, test_prompts, test_storage,
-                 test_whatsapp_pure):
+                 test_vision_pure, test_whatsapp_pure):
         try:
             test()
         except Exception:
