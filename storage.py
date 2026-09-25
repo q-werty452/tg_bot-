@@ -72,9 +72,20 @@ class Session:
     # Подтягивали ли мы историю из панели после перезапуска бота.
     restored: bool = False
 
-    def add(self, role: str, content: str, limit: int) -> None:
-        """Добавить сообщение в историю и обрезать её, если стала слишком длинной."""
-        self.history.append({"role": role, "content": content})
+    def add(self, role: str, content: str, limit: int,
+             images: list[str] | None = None) -> None:
+        """
+        Добавить сообщение в историю и обрезать её, если стала слишком длинной.
+
+        images — пути к файлам фотографий, приложенных к этому сообщению
+        (только для role="user"). Каждый провайдер сам решает, как их
+        показать модели (см. providers/*.py); формат истории от этого
+        не меняется, поэтому переключение модели посреди диалога не ломается.
+        """
+        entry: dict = {"role": role, "content": content}
+        if images:
+            entry["images"] = images
+        self.history.append(entry)
         if len(self.history) > limit:
             # Оставляем только последние `limit` сообщений.
             # Зачем: длинная история = больше токенов = дороже и медленнее.
