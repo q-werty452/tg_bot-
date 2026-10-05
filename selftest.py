@@ -223,7 +223,7 @@ def test_prompts() -> None:
     for mode in (Mode.DETAILED, Mode.CHAT):
         text = prompts.SYSTEM_PROMPTS[mode]
         name = mode.value
-        check(f"{name}: указан город Манас", "Манас" in text)
+        check(f"{name}: указана Джалал-Абадская область", "Джалал-Абад" in text)
         check(f"{name}: указана Кыргызская Республика", "Кыргызск" in text)
         check(f"{name}: запрещены ссылки на право РФ", "Никогда не ссылайся" in text)
         check(f"{name}: сохранён запрет эмодзи", "эмодзи" in text.lower())
