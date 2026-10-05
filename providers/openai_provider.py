@@ -89,14 +89,23 @@ class OpenAIProvider(LLMProvider):
         # Некоторые модели/шлюзы принимают только устаревшее имя max_tokens.
         # Определяем это один раз при первой ошибке и дальше не спотыкаемся.
         self._legacy_token_param = False
+        # «Рассуждающие» модели (gpt-5*) тратят часть max_completion_tokens
+        # на невидимые рассуждения ДО того, как начнут писать ответ. При
+        # небольшом лимите (диалоговый режим) рассуждения могут съесть весь
+        # лимит, и модель вернёт пустой ответ (finish_reason="length").
+        # reasoning_effort="minimal" сводит эти траты почти к нулю — нам
+        # для короткого чат-ответа глубокие рассуждения и не нужны.
+        self._reasoning_model = model.startswith("gpt-5")
 
     async def _create(self, messages: list[dict], max_tokens: int):
         """Один вызов API с учётом того, как эта модель называет лимит токенов."""
         limit_field = "max_tokens" if self._legacy_token_param else "max_completion_tokens"
+        extra = {"reasoning_effort": "minimal"} if self._reasoning_model else {}
         return await self._client.chat.completions.create(
             model=self._model,
             messages=messages,
             **{limit_field: max_tokens},
+            **extra,
         )
 
     async def ask(
@@ -113,11 +122,17 @@ class OpenAIProvider(LLMProvider):
             try:
                 response = await self._create(messages, max_tokens)
             except BadRequestError as e:
-                # Модель не знает max_completion_tokens — пробуем старое имя.
                 text = str(e)
                 if not self._legacy_token_param and "max_completion_tokens" in text:
+                    # Модель не знает max_completion_tokens — пробуем старое имя.
                     logger.info("OpenAI: модель %s требует max_tokens, переключаюсь", self._model)
                     self._legacy_token_param = True
+                    response = await self._create(messages, max_tokens)
+                elif self._reasoning_model and "reasoning_effort" in text:
+                    # Модель не принимает reasoning_effort — не рассуждающая,
+                    # несмотря на имя gpt-5*. Отключаем и повторяем без него.
+                    logger.info("OpenAI: модель %s не знает reasoning_effort, отключаю", self._model)
+                    self._reasoning_model = False
                     response = await self._create(messages, max_tokens)
                 else:
                     raise
