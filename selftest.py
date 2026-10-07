@@ -36,6 +36,12 @@ PASSED: list[str] = []
 FAILED: list[tuple[str, str]] = []
 
 
+def citizen_part(content: str) -> str:
+    """Само сообщение жителя без служебных блоков (справочник, «О жителе»),
+    которые бот приклеивает к нему для модели (prompts.compose_user_turn)."""
+    return content.split("[Сообщение жителя]\n", 1)[-1]
+
+
 def check(name: str, condition: bool, detail: str = "") -> None:
     if condition:
         PASSED.append(name)
@@ -258,7 +264,17 @@ def test_prompts() -> None:
     finally:
         prompts.DEMO_MODE, prompts.CITY_FACTS = saved_mode, saved_facts
 
-    check("по умолчанию включён режим показа", prompts.DEMO_MODE is True)
+    # Бот отвечает жителям всерьёз: режим показа (додумывать телефоны и
+    # адреса) по умолчанию выключен.
+    check("по умолчанию рабочий режим — без выдумок", prompts.DEMO_MODE is False)
+    strict = prompts.build_system(Mode.CHAT, invent=False)
+    check("рабочий режим: поиск в интернете по служебной строке",
+          prompts.SEARCH_MARKER in strict)
+    check("рабочий режим: ФИО и место — только при обращении",
+          "Справочный вопрос" in strict and "отчество" in strict)
+    check("рабочий режим: Конституция — только из данного текста",
+          "Конституция КР" in strict)
+    check("рабочий режим: просьба переспросить непонятное", "переспроси" in strict)
 
 
 # ===========================================================================
@@ -521,16 +537,32 @@ def make_callback(data: str, chat_id: int = 500, message_id: int = 800):
 
 
 class StubProvider:
-    """Подставной ИИ: отвечает заранее заданным текстом или падает с ошибкой."""
+    """
+    Подставной ИИ: отвечает заранее заданным текстом или падает с ошибкой.
+
+    Разбор переписки для карточки (classify.py) — тоже вызов модели, но
+    другого рода: его ответы и вызовы живут отдельно (extract_answer,
+    extract_calls), чтобы проверки «модель вызвана N раз» по-прежнему
+    считали только ответы жителю.
+    """
 
     def __init__(self):
         self.answer = "Ответ модели."
         self.error: Exception | None = None
         self.delay = 0.0
         self.calls: list[list[dict]] = []
+        self.systems: list[str] = []
+        self.extract_answer = ('{"kind": "appeal", "title": "Тестовое обращение", '
+                               '"summary": "Житель сообщил о проблеме", "category": "other"}')
+        self.extract_calls: list[str] = []
 
     async def ask(self, system, history, max_tokens, detailed):
+        import classify as _classify
+        if system.startswith(_classify.EXTRACT_PROMPT[:40]):
+            self.extract_calls.append(history[-1]["content"])
+            return self.extract_answer
         self.calls.append([dict(m) for m in history])
+        self.systems.append(system)
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.error:
@@ -950,6 +982,9 @@ class FakePanel:
         self.history_messages: list[dict] = []
         self.retitled = False
         self.retitle_calls: list[str] = []
+        self.message_id = 500        # id сообщений жителя в «панели»
+        self.split_calls: list[tuple[str, dict]] = []
+        self.split_to = 2            # номер заявки, которую «создаст» разделение
 
     def handler(self, request):
         import httpx, json as _json
@@ -958,8 +993,10 @@ class FakePanel:
         path = request.url.path
         self.requests.append((request.method, path, request.content))
         if path.endswith("/tickets/incoming/"):
+            self.message_id += 1
             payload = {"ticket_id": self.ticket_id, "number": "2026-0001",
-                       "answer_mode": self.answer_mode, "created": self.created}
+                       "answer_mode": self.answer_mode, "created": self.created,
+                       "message_id": self.message_id}
             self.created = False  # следующие сообщения дописываются в карточку
             return httpx.Response(200, json=payload)
         if "/messages/" in path and path.endswith("/rating/"):
@@ -973,6 +1010,12 @@ class FakePanel:
         if path.endswith("/history/"):
             return httpx.Response(200, json={"ticket_id": self.ticket_id,
                                              "messages": self.history_messages})
+        if path.endswith("/split/"):
+            body = _json.loads(request.content or b"{}")
+            self.split_calls.append((path, body))
+            self.ticket_id = self.split_to
+            return httpx.Response(200, json={"ticket_id": self.split_to,
+                                             "number": "2026-0002"})
         if path.endswith("/retitle/"):
             body = _json.loads(request.content or b"{}")
             applied = not self.retitled
@@ -1315,9 +1358,11 @@ async def test_whatsapp_dialog_with_panel() -> None:
     panel = FakePanel()
     client = connect_fake_panel(panel)
 
+    import classify as classify_module
     stub = StubProvider()
     stub.answer = "Заявку приняли, разберёмся."
     conversation_module.get_provider = lambda name: stub
+    classify_module.get_provider = lambda name: stub
 
     sent: list[tuple[str, str]] = []
 
@@ -1417,70 +1462,1242 @@ class SequencedStub:
         return self.answers.pop(0) if self.answers else "НЕЯСНО"
 
 
-async def test_retitle() -> None:
-    section("13. Доводка заявки по переписке (classify.refine_ticket)")
+async def settle() -> None:
+    """Дождаться фоновых задач бота (разбор переписки, геометка в панель)."""
+    import conversation as conversation_module
+    for _ in range(20):
+        pending = [t for t in conversation_module._BACKGROUND if not t.done()]
+        if not pending:
+            return
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def classify_bodies(panel, ticket_id: int | None = None) -> list[dict]:
+    """Тела запросов /classify/ в подставную панель (по заявке, если указана)."""
     import json as _json
+    suffix = f"/tickets/{ticket_id}/classify/" if ticket_id else "/classify/"
+    return [_json.loads(body) for _, path, body in panel.requests if path.endswith(suffix)]
+
+
+async def test_update_ticket() -> None:
+    section("13. Карточка по переписке (classify.update_ticket)")
+    import asyncio as _asyncio
 
     import classify as classify_module
     from providers import ProviderError
+    from remote_config import remote
+    from storage import Session
+
+    # Фоновые разборы из прошлых разделов (там тоже заявка №1) не должны
+    # подхватить подменённую здесь модель — начинаем с чистого листа.
+    await settle()
+    classify_module._RUNNING.clear()
+    classify_module._DIRTY.clear()
 
     panel = FakePanel()
     client = connect_fake_panel(panel)
+    saved_data = remote.data
+    remote.data = {**(saved_data or {}),
+                   "categories": [{"slug": "water", "name": "Вода"},
+                                  {"slug": "roads", "name": "Дороги"},
+                                  {"slug": "other", "name": "Прочее"}],
+                   "districts": [{"slug": "nooken", "name": "Ноокенский район"}]}
 
-    stub = SequencedStub([])
+    # --- разбор ответа модели: ничему не верим
+    r = classify_module.parse_extract(
+        'вот: {"kind": "APPEAL", "category": "water", "district": "Ноокен", '
+        '"executor": "org-x", "phone": "0555 12-34-56", "new_topic": "yes"} конец',
+        {"water"}, {"nooken"}, {"org-1"})
+    check("разбор: тип приведён к нижнему регистру", r["kind"] == "appeal", str(r))
+    check("разбор: район не по коду — выброшен", r["district"] == "", str(r))
+    check("разбор: исполнитель не из кандидатов — выброшен", r["executor"] == "", str(r))
+    check("разбор: телефон 0555... -> 996555...", r["phone"] == "996555123456", str(r))
+    check("разбор: new_topic засчитан только при true", r["new_topic"] is False, str(r))
+    check("разбор: не-JSON -> None",
+          classify_module.parse_extract("не знаю", set(), set(), set()) is None)
+
+    def new_session(*lines) -> Session:
+        session = Session(provider="openai")
+        session.ticket_id = 1
+        crm_id = 500
+        for role, text in lines:
+            crm_id += 1
+            session.add(role, text, 20, crm_id=crm_id if role == "user" else None)
+            if role == "user":
+                session.last_message_id = crm_id
+        return session
+
+    # --- приветствие: тип есть, темы и категории ещё нет
+    stub = SequencedStub(['{"kind": "other", "title": "Приветствие", "category": "other"}'])
     classify_module.get_provider = lambda name: stub
-
-    panel.history_messages = []
-    await classify_module.refine_ticket(client, 1, "openai", delay=0)
-    check("без истории заголовок не трогается", panel.retitle_calls == [],
-          str(panel.retitle_calls))
-
-    panel.history_messages = [
-        {"author": "citizen", "text": "Привет, течёт труба во дворе"},
-        {"author": "ai", "text": "Напишите адрес, передам в ЖКХ"},
-        {"author": "citizen", "text": "Ул. Ленина 5"},
-    ]
-
-    # заголовок понятен, адрес — из переписки, не из первой фразы
-    stub.answers = [
-        "Течёт труба во дворе",
-        '{"title": "x", "category": "utilities", "district": "", "address": "Ул. Ленина 5"}',
-    ]
+    session = new_session(("user", "Здравствуйте"), ("assistant", "Здравствуйте! Чем помочь?"))
     panel.requests.clear()
-    await classify_module.refine_ticket(client, 1, "openai", delay=0)
-    check("заголовок отправлен", panel.retitle_calls == ["Течёт труба во дворе"],
-          str(panel.retitle_calls))
-    classify_body = next(
-        (_json.loads(body) for _, p, body in panel.requests if p.endswith("/classify/")), None)
-    check("запрос на классификацию по всей переписке дошёл", classify_body is not None)
-    check("адрес из переписки попал в запрос",
-          bool(classify_body) and classify_body.get("address") == "Ул. Ленина 5",
-          str(classify_body))
+    await classify_module.update_ticket(client, session, "openai")
+    body = (classify_bodies(panel, 1) or [{}])[0]
+    check("приветствие: в панель ушёл тип обращения", body.get("kind") == "other", str(body))
+    check("приветствие: тема и категория не ставятся (заявка не застрянет на «Прочее»)",
+          "title" not in body and "category" not in body, str(body))
 
-    # модель не поняла тему — заголовок не трогаем, классификацию всё равно пробуем
-    panel.retitle_calls.clear()
-    stub.answers = ["НЕЯСНО", '{"title": "x", "category": "other", "district": "", "address": ""}']
-    await classify_module.refine_ticket(client, 1, "openai", delay=0)
-    check("НЕЯСНО не уходит в панель", panel.retitle_calls == [], str(panel.retitle_calls))
+    # --- полноценное обращение: все поля, исполнитель из кандидатов
+    full = ('{"kind": "appeal", "title": "Нет воды в Масы", "summary": "Третий день нет воды",'
+            ' "category": "water", "district": "nooken", "settlement": "Масы",'
+            ' "address": "ул. Ленина 5", "last_name": "Асанов", "first_name": "Бакыт",'
+            ' "middle_name": "Асанович", "phone": "0555123456", "executor": "org-1"}')
+    stub = SequencedStub([full, full])
+    classify_module.get_provider = lambda name: stub
+    session = new_session(("user", "В Масы нет воды третий день, я Асанов Бакыт Асанович, 0555123456"),
+                          ("assistant", "Передам в водоканал."))
+    session.candidates = [{"id": "org-1", "name": "Водоканал Ноокен"}]
+    panel.requests.clear()
+    await classify_module.update_ticket(client, session, "openai")
+    body = (classify_bodies(panel, 1) or [{}])[0]
+    check("обращение: в панель ушли ФИО с отчеством",
+          (body.get("last_name"), body.get("first_name"), body.get("middle_name"))
+          == ("Асанов", "Бакыт", "Асанович"), str(body))
+    check("обращение: место (район, село, адрес)",
+          (body.get("district"), body.get("settlement"), body.get("address"))
+          == ("nooken", "Масы", "ул. Ленина 5"), str(body))
+    check("обращение: исполнитель из справочника и категория",
+          body.get("executor") == "org-1" and body.get("category") == "water", str(body))
+    check("обращение: суть уходит как описание",
+          body.get("description") == "Третий день нет воды", str(body))
+    check("обращение: продиктованный телефон", body.get("phone") == "996555123456", str(body))
+    check("обращение: тема отправлена", body.get("title") == "Нет воды в Масы", str(body))
+    known = classify_module.describe_known(session.known)
+    check("модель дальше знает ФИО, номер и место",
+          "Асанов Бакыт Асанович" in known and "номер телефона известен" in known
+          and "Ноокенский район" in known and "Масы" in known, known)
 
-    # сбой модели на этапе классификации не роняет задачу
-    stub.answers = ["Тема"]
+    session.add("user", "А ещё напор слабый был всю неделю до этого, это важно", 20, crm_id=600)
+    session.last_message_id = 600
+    panel.requests.clear()
+    await classify_module.update_ticket(client, session, "openai")
+    body = (classify_bodies(panel, 1) or [{}])[0]
+    check("тема заявки отправляется один раз", "title" not in body, str(body))
 
-    async def broken_ask(*a, **kw):
-        raise ProviderError("временная ошибка")
+    # --- обращение заполнено: короткое «спасибо» не перечитываем
+    calls = len(stub.systems)
+    session.add("user", "спасибо", 20, crm_id=601)
+    await classify_module.update_ticket(client, session, "openai")
+    check("заполненное обращение: «спасибо» не тратит запрос к модели",
+          len(stub.systems) == calls, str(len(stub.systems)))
 
-    stub.ask = broken_ask
+    # --- номер из WhatsApp надёжнее продиктованного
+    stub = SequencedStub([full])
+    classify_module.get_provider = lambda name: stub
+    session = new_session(("user", "нет воды"), ("assistant", "Где именно?"))
+    session.known.update(phone="996700111222", phone_source="channel")
+    panel.requests.clear()
+    await classify_module.update_ticket(client, session, "openai")
+    body = (classify_bodies(panel, 1) or [{}])[0]
+    check("номер из канала не подменяется продиктованным",
+          body.get("phone") == "996700111222", str(body))
+
+    # --- житель заговорил о другой проблеме: новая заявка
+    split = ('{"kind": "appeal", "title": "Яма на дороге", "summary": "Яма",'
+             ' "category": "roads", "new_topic": true}')
+    after = ('{"kind": "appeal", "title": "Яма на дороге", "summary": "Яма у школы",'
+             ' "category": "roads", "settlement": "Кочкор-Ата"}')
+    stub = SequencedStub([split, after])
+    classify_module.get_provider = lambda name: stub
+    session = new_session(("user", "Нет воды в Масы"), ("assistant", "Передали в водоканал."))
+    session.known.update(kind="appeal", summary="Нет воды в Масы", last_name="Асанов",
+                         first_name="Бакыт", settlement="Масы")
+    session.add("user", "И ещё: у школы в Кочкор-Ате огромная яма на дороге", 20, crm_id=777)
+    session.last_message_id = 777
+    session.add("assistant", "Понял, запишу.", 20)
+    panel.requests.clear(); panel.split_calls.clear(); panel.ticket_id = 1
+    await classify_module.update_ticket(client, session, "openai")
+    check("смена темы: панель просят разделить заявку с нужного сообщения",
+          bool(panel.split_calls) and panel.split_calls[0][0].endswith("/tickets/1/split/")
+          and panel.split_calls[0][1].get("from_message_id") == 777, str(panel.split_calls))
+    check("смена темы: бот ведёт уже новую заявку", session.ticket_id == 2, str(session.ticket_id))
+    check("смена темы: ФИО жителя сохранились, место старой заявки забыто",
+          session.known.get("last_name") == "Асанов"
+          and session.known.get("settlement") == "Кочкор-Ата", str(session.known))
+    check("смена темы: новая заявка сразу разобрана по новой теме",
+          bool(classify_bodies(panel, 2))
+          and classify_bodies(panel, 2)[0].get("category") == "roads",
+          str(classify_bodies(panel, 2)))
+    check("смена темы: старую заявку классификация не трогала",
+          not classify_bodies(panel, 1), str(classify_bodies(panel, 1)))
+    marked = [m for m in session.history if m.get("topic_start")]
+    check("смена темы: начало новой темы помечено в истории",
+          len(marked) == 1 and marked[0].get("crm_id") == 777, str(marked))
+    check("смена темы: разбор новой заявки видит только новую тему",
+          "Нет воды в Масы" not in classify_module._conversation(session.history))
+
+    # --- пока модель думала, заявка сменилась: старый разбор выбрасывается
+    class Switcher:
+        def __init__(self, session):
+            self.session = session
+
+        async def ask(self, system, history, max_tokens, detailed):
+            self.session.ticket_id = 5
+            return full
+
+    session = new_session(("user", "нет воды"), ("assistant", "Где?"))
+    classify_module.get_provider = lambda name: Switcher(session)
+    panel.requests.clear()
+    await classify_module.update_ticket(client, session, "openai")
+    check("устаревший разбор не пишется в старую заявку",
+          not classify_bodies(panel, 1), str(classify_bodies(panel, 1)))
+
+    # --- два сообщения подряд: второй разбор не запускается параллельно,
+    #     а прогоняется ещё раз после первого — уже по свежей переписке
+    gate = _asyncio.Event()
+
+    class Slow:
+        def __init__(self):
+            self.calls = 0
+
+        async def ask(self, system, history, max_tokens, detailed):
+            self.calls += 1
+            await gate.wait()
+            return '{"kind": "question"}'
+
+    slow = Slow()
+    classify_module.get_provider = lambda name: slow
+    session = new_session(("user", "где ЦОН"), ("assistant", "ЦОН на Ленина"))
+    first = _asyncio.create_task(classify_module.update_ticket(client, session, "openai"))
+    await _asyncio.sleep(0.01)
+    await classify_module.update_ticket(client, session, "openai")
+    check("параллельный разбор той же заявки не запускается", slow.calls == 1, str(slow.calls))
+    gate.set()
+    await first
+    check("после первого разбора — ещё один по свежей переписке", slow.calls == 2, str(slow.calls))
+    check("после разбора заявка снята с учёта", 1 not in classify_module._RUNNING)
+
+    # --- сбой модели не роняет задачу и ничего не пишет
+    class Broken:
+        async def ask(self, *a, **kw):
+            raise ProviderError("временная ошибка")
+
+    classify_module.get_provider = lambda name: Broken()
+    session = new_session(("user", "нет воды"), ("assistant", "Где?"))
+    panel.requests.clear()
     try:
-        await classify_module.refine_ticket(client, 1, "openai", delay=0)
+        await classify_module.update_ticket(client, session, "openai")
         ok = True
     except Exception:
         ok = False
     check("сбой модели не роняет фоновую задачу", ok)
+    check("при сбое в панель ничего не ушло", not classify_bodies(panel), str(panel.requests))
 
+    remote.data = saved_data
     await client.close()
 
 
 # ===========================================================================
+# 14. Голосовые сообщения: transcribe.py, Telegram и WhatsApp
+#     Платных запросов нет: клиент OpenAI и сама расшифровка подменены.
+# ===========================================================================
+
+class FakeOpenAI:
+    """Подставной AsyncOpenAI: запоминает, с чем его создали и что спросили."""
+
+    instances: list["FakeOpenAI"] = []
+    text = "Расшифрованный текст"
+    error: Exception | None = None
+
+    def __init__(self, **kwargs):
+        import types
+        self.kwargs = kwargs
+        self.calls: list[dict] = []
+        self.audio = types.SimpleNamespace(
+            transcriptions=types.SimpleNamespace(create=self._create))
+        FakeOpenAI.instances.append(self)
+
+    async def _create(self, **kwargs):
+        import types
+        self.calls.append(kwargs)
+        if FakeOpenAI.error:
+            raise FakeOpenAI.error
+        return types.SimpleNamespace(text=FakeOpenAI.text)
+
+
+async def test_transcribe_module() -> None:
+    section("14. Расшифровка голоса (transcribe.py, без сети)")
+    import tempfile
+    import types
+    from pathlib import Path
+
+    import httpx
+    import openai
+
+    import providers
+    import transcribe as tr
+
+    check("расширение по mime из WhatsApp (с codecs=opus) — .ogg",
+          tr.upload_extension("/x/file", "audio/ogg; codecs=opus") == ".ogg")
+    check("mime mp3/m4a/mp4/wav распознаются",
+          [tr.upload_extension("/x/f", m) for m in
+           ("audio/mpeg", "audio/mp4", "video/mp4", "audio/x-wav")]
+          == [".mp3", ".m4a", ".mp4", ".wav"])
+    check("mime важнее неверного суффикса",
+          tr.upload_extension("/x/voice.bin", "audio/ogg") == ".ogg")
+    check("без mime берётся суффикс файла, .oga -> .ogg",
+          tr.upload_extension("/x/a.oga") == ".ogg" and tr.upload_extension("/x/a.MP3") == ".mp3")
+    check("неизвестный формат -> пусто",
+          tr.upload_extension("/x/a.xyz") == "" and tr.upload_extension("/x/a", "image/png") == "")
+
+    saved_client_cls = tr.AsyncOpenAI
+    saved_settings = tr.settings
+    saved_model_env = os.environ.pop("TRANSCRIBE_MODEL", None)
+    tr.AsyncOpenAI = FakeOpenAI
+    tr._client_cache.clear()
+    FakeOpenAI.instances.clear()
+    FakeOpenAI.error = None
+    providers.apply_overrides({})
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = Path(tmp) / "voice.ogg"
+            audio.write_bytes(b"OggS-fake-audio")
+
+            # --- успешный вызов: модель, имя файла, подсказка, язык не задан
+            FakeOpenAI.text = "  Нет воды в Ноокене  "
+            text = await tr.transcribe(str(audio), mime="audio/ogg; codecs=opus")
+            call = FakeOpenAI.instances[-1].calls[-1]
+            check("расшифровка возвращает текст без пробелов по краям",
+                  text == "Нет воды в Ноокене", repr(text))
+            check("модель по умолчанию — gpt-4o-transcribe", call["model"] == "gpt-4o-transcribe",
+                  str(call.get("model")))
+            check("файл уходит с правильным расширением в имени",
+                  call["file"][0] == "audio.ogg" and call["file"][1] == b"OggS-fake-audio",
+                  str(call["file"][0]))
+            check("язык не фиксируется (речь смешанная ru/ky)", "language" not in call)
+            check("подсказка содержит словарь области",
+                  all(w in call["prompt"] for w in
+                      ("Жалал-Абад", "Ноокен", "Кербен", "айыл өкмөтү", "Социальный фонд")))
+            check("таймаут клиента — 60 с",
+                  FakeOpenAI.instances[-1].kwargs.get("timeout") == 60.0,
+                  str(FakeOpenAI.instances[-1].kwargs))
+
+            # --- модель из окружения
+            os.environ["TRANSCRIBE_MODEL"] = "whisper-1"
+            await tr.transcribe(str(audio), mime="audio/ogg")
+            check("TRANSCRIBE_MODEL переопределяет модель",
+                  FakeOpenAI.instances[-1].calls[-1]["model"] == "whisper-1")
+            os.environ.pop("TRANSCRIBE_MODEL")
+
+            # --- клиент кэшируется по ключу и пересоздаётся при смене ключа
+            created = len(FakeOpenAI.instances)
+            await tr.transcribe(str(audio), mime="audio/ogg")
+            check("клиент переиспользуется, пока ключ тот же",
+                  len(FakeOpenAI.instances) == created)
+            providers.apply_overrides({"openai": {"key": "sk-from-panel"}})
+            await tr.transcribe(str(audio), mime="audio/ogg")
+            check("ключ из панели перекрывает .env и даёт нового клиента",
+                  FakeOpenAI.instances[-1].kwargs.get("api_key") == "sk-from-panel"
+                  and len(FakeOpenAI.instances) == created + 1)
+            providers.apply_overrides({})
+
+            # --- пустая расшифровка и эхо подсказки
+            FakeOpenAI.text = "   "
+            check("пустая расшифровка -> пустая строка",
+                  await tr.transcribe(str(audio), mime="audio/ogg") == "")
+            FakeOpenAI.text = "Населённые пункты: Жалал-Абад, Манас, Ноокен, Сузак, Базар-Коргон"
+            check("кусок подсказки вместо речи (тишина) -> пусто",
+                  await tr.transcribe(str(audio), mime="audio/ogg") == "")
+            FakeOpenAI.text = "Манас"
+            check("короткое слово из словаря — настоящая речь, не отбрасывается",
+                  await tr.transcribe(str(audio), mime="audio/ogg") == "Манас")
+
+            # --- слишком большой файл: ошибка ДО обращения к сети
+            big = Path(tmp) / "big.ogg"
+            with big.open("wb") as f:
+                f.truncate(26 * 1024 * 1024)
+            calls_before = sum(len(i.calls) for i in FakeOpenAI.instances)
+            try:
+                await tr.transcribe(str(big), mime="audio/ogg")
+                check("файл > 25 МБ -> TranscribeError", False)
+            except tr.TranscribeError as e:
+                check("файл > 25 МБ -> TranscribeError", "лимита" in e.message, e.message)
+                check("для большого файла есть текст жителю (сократить)",
+                      "сократите" in e.public_text and "Кыскартып" in e.public_text)
+            check("большой файл не отправлялся в OpenAI",
+                  sum(len(i.calls) for i in FakeOpenAI.instances) == calls_before)
+
+            # --- слишком длинная запись (длительность известна от Telegram)
+            try:
+                await tr.transcribe(str(audio), duration=601, mime="audio/ogg")
+                check("запись > 10 минут -> TranscribeError", False)
+            except tr.TranscribeError as e:
+                check("запись > 10 минут -> TranscribeError с просьбой сократить",
+                      "сократите" in e.public_text, e.public_text)
+            check("ровно 10 минут ещё принимаются",
+                  await tr.transcribe(str(audio), duration=600, mime="audio/ogg") == "Манас")
+
+            # --- неподдерживаемый формат
+            weird = Path(tmp) / "voice.xyz"
+            weird.write_bytes(b"x")
+            try:
+                await tr.transcribe(str(weird))
+                check("неподдерживаемый формат -> TranscribeError", False)
+            except tr.TranscribeError as e:
+                check("неподдерживаемый формат -> TranscribeError",
+                      "формат" in e.message, e.message)
+
+            # --- ошибки OpenAI -> понятный текст, а не traceback
+            request = httpx.Request("POST", "https://api.openai.test/v1/audio/transcriptions")
+            FakeOpenAI.error = openai.RateLimitError(
+                "quota", response=httpx.Response(429, request=request), body=None)
+            try:
+                await tr.transcribe(str(audio), mime="audio/ogg")
+                check("лимит/баланс -> TranscribeError", False)
+            except tr.TranscribeError as e:
+                check("лимит/баланс -> TranscribeError", "баланс" in e.message, e.message)
+                check("у ошибки баланса нет текста жителю (будет общий)", e.public_text == "")
+            FakeOpenAI.error = openai.APIConnectionError(request=request)
+            try:
+                await tr.transcribe(str(audio), mime="audio/ogg")
+                check("обрыв сети -> TranscribeError", False)
+            except tr.TranscribeError as e:
+                check("обрыв сети -> TranscribeError", "нет связи" in e.message.lower(), e.message)
+            FakeOpenAI.error = openai.APITimeoutError(request=request)
+            try:
+                await tr.transcribe(str(audio), mime="audio/ogg")
+                check("таймаут -> TranscribeError", False)
+            except tr.TranscribeError as e:
+                check("таймаут -> TranscribeError", "времени" in e.message, e.message)
+            FakeOpenAI.error = openai.AuthenticationError(
+                "bad key", response=httpx.Response(401, request=request), body=None)
+            try:
+                await tr.transcribe(str(audio), mime="audio/ogg")
+                check("неверный ключ -> TranscribeError", False)
+            except tr.TranscribeError as e:
+                check("неверный ключ -> TranscribeError", "ключ" in e.message, e.message)
+            FakeOpenAI.error = None
+
+            # --- ключа нет ни в панели, ни в .env
+            tr._client_cache.clear()
+            tr.settings = types.SimpleNamespace(openai_api_key=None)
+            try:
+                await tr.transcribe(str(audio), mime="audio/ogg")
+                check("нет ключа -> TranscribeError", False)
+            except tr.TranscribeError as e:
+                check("нет ключа -> TranscribeError", "ключ" in e.message.lower(), e.message)
+    finally:
+        tr.AsyncOpenAI = saved_client_cls
+        tr.settings = saved_settings
+        tr._client_cache.clear()
+        providers.apply_overrides({})
+        if saved_model_env is not None:
+            os.environ["TRANSCRIBE_MODEL"] = saved_model_env
+
+
+def make_voice_update(kind: str = "voice", chat_id: int = 610, message_id: int = 950):
+    """Входящее голосовое / аудиофайл / видеокружок так, как их присылает Telegram."""
+    import datetime
+
+    from aiogram.types import Audio, Chat, Message, Update, User, VideoNote, Voice
+
+    fields: dict = {}
+    if kind == "voice":
+        fields["voice"] = Voice(file_id="v", file_unique_id="vu", duration=7,
+                                mime_type="audio/ogg", file_size=4000)
+    elif kind == "audio":
+        fields["audio"] = Audio(file_id="a", file_unique_id="au", duration=30,
+                                file_name="zapis.m4a", mime_type="audio/mp4",
+                                file_size=90000)
+    elif kind == "video_note":
+        fields["video_note"] = VideoNote(file_id="n", file_unique_id="nu", length=240,
+                                         duration=12, file_size=50000)
+    elif kind == "big_voice":
+        fields["voice"] = Voice(file_id="v", file_unique_id="vu", duration=7,
+                                mime_type="audio/ogg", file_size=30 * 1024 * 1024)
+    msg = Message(
+        message_id=message_id,
+        date=datetime.datetime.now(),
+        chat=Chat(id=chat_id, type="private"),
+        from_user=User(id=chat_id, is_bot=False, first_name="Житель"),
+        **fields,
+    )
+    return Update(update_id=message_id, message=msg)
+
+
+async def test_voice_telegram() -> None:
+    section("15. Telegram: голосовые сообщения")
+    import tempfile
+    from pathlib import Path
+
+    import bot as bot_module
+    import classify as classify_module
+    import conversation as conversation_module
+    import transcribe as tr
+    from aiogram import Bot
+    from remote_config import remote
+
+    panel = FakePanel()
+    client = connect_fake_panel(panel)
+
+    fake = FakeTelegram()
+    bot = Bot(token=os.environ["TELEGRAM_BOT_TOKEN"], session=fake.build_session())
+    stub = StubProvider()
+    stub.answer = "Передали в водоканал."
+    conversation_module.get_provider = lambda name: stub
+    classify_module.get_provider = lambda name: stub
+    storage = bot_module.storage
+    dp = bot_module.dp
+
+    # Что «услышал» подставной распознаватель и что ему передали.
+    heard = {"text": "В Ноокене нет воды третий день", "error": None, "calls": []}
+
+    async def fake_transcribe(path, *, duration=None, mime=None):
+        heard["calls"].append({"path": path, "duration": duration, "mime": mime,
+                               "exists": Path(path).exists()})
+        if heard["error"]:
+            raise heard["error"]
+        return heard["text"]
+
+    saved_transcribe = tr.transcribe
+    saved_media_dir = bot_module.MEDIA_DIR
+    tr.transcribe = fake_transcribe
+    tmp = tempfile.TemporaryDirectory()
+    bot_module.MEDIA_DIR = Path(tmp.name)
+
+    async def feed(update):
+        await dp.feed_update(bot, update)
+        await asyncio.sleep(0.05)  # даём фоновым задачам (классификация) отработать
+
+    def incoming_bodies():
+        return [body for _, path, body in panel.requests if path.endswith("/tickets/incoming/")]
+
+    chat = 610
+    try:
+        # --- голосовое: расшифровка -> модель -> ответ, в панель текст и файл
+        storage.get(chat).clear()
+        storage.get(chat).restored = True
+        fake.clear(); panel.requests.clear(); heard["calls"].clear()
+        calls_before = len(stub.calls)
+        await feed(make_voice_update("voice", chat))
+        sent_to_model = (citizen_part(stub.calls[-1][-1]["content"])
+                         if len(stub.calls) > calls_before else "")
+        check("TG голосовое: расшифровка вызвана с mime и длительностью",
+              bool(heard["calls"]) and heard["calls"][0]["mime"] == "audio/ogg"
+              and heard["calls"][0]["duration"] == 7, str(heard["calls"]))
+        check("TG голосовое: файл был скачан до расшифровки",
+              bool(heard["calls"]) and heard["calls"][0]["exists"]
+              and heard["calls"][0]["path"].endswith(".ogg"), str(heard["calls"]))
+        check("TG голосовое: модель получила текст с пометкой об автоматической расшифровке",
+              sent_to_model.startswith("[Голосовое сообщение, автоматическая расшифровка")
+              and "возможны ошибки распознавания" in sent_to_model
+              and sent_to_model.endswith(heard["text"]), sent_to_model)
+        check("TG голосовое: житель получил ответ модели", stub.answer in fake.texts(),
+              str(fake.texts()))
+        check("TG голосовое: показан статус «печатает» на время расшифровки",
+              any(c[0] == "SendChatAction" for c in fake.calls))
+        bodies = incoming_bodies()
+        check("TG голосовое: в карточку ушла расшифровка с пометкой [Голосовое]",
+              bool(bodies) and f"[Голосовое] {heard['text']}".encode() in bodies[0], str(bodies)[:200])
+        check("TG голосовое: сам аудиофайл приложен к карточке",
+              bool(bodies) and b"_voice.ogg" in bodies[0])
+        await settle()   # карточка дозаполняется фоном после ответа
+        check("TG голосовое: тема карточки определяется (классификация ушла)",
+              any(p.endswith("/tickets/1/classify/") for _, p, _ in panel.requests))
+        check("TG голосовое: ответ ИИ записан в карточку",
+              any(p.endswith("/tickets/1/messages/") for _, p, _ in panel.requests))
+
+        # --- аудиофайл и видеокружок тоже маршрутизируются
+        for kind, suffix, seconds in (("audio", ".m4a", 30), ("video_note", ".mp4", 12)):
+            storage.get(chat).clear()
+            fake.clear(); panel.requests.clear(); heard["calls"].clear()
+            calls_before = len(stub.calls)
+            await feed(make_voice_update(kind, chat, message_id=960))
+            check(f"TG {kind}: расшифровка вызвана, файл с расширением {suffix}",
+                  bool(heard["calls"]) and heard["calls"][0]["path"].endswith(suffix),
+                  str(heard["calls"]))
+            check(f"TG {kind}: длительность {seconds} с передана расшифровке",
+                  bool(heard["calls"]) and heard["calls"][0]["duration"] == seconds,
+                  str(heard["calls"]))
+            check(f"TG {kind}: модель получила расшифровку",
+                  len(stub.calls) > calls_before
+                  and stub.calls[-1][-1]["content"].endswith(heard["text"]))
+            check(f"TG {kind}: файл приложен к карточке",
+                  bool(incoming_bodies()) and suffix.encode() in incoming_bodies()[0])
+
+        # --- пустая расшифровка: вежливый текст, модель не зовётся, файл в панели
+        storage.get(chat).clear()
+        panel.created = True
+        heard["text"] = ""
+        fake.clear(); panel.requests.clear()
+        calls_before = len(stub.calls)
+        await feed(make_voice_update("voice", chat, message_id=970))
+        out = " ".join(fake.texts())
+        check("TG пустая расшифровка: вежливый двуязычный ответ",
+              "Не удалось разобрать голосовое сообщение" in out
+              and "Үн билдирүүнү түшүнө алган жокмун" in out, out)
+        check("TG пустая расшифровка: модель не вызвана", len(stub.calls) == calls_before)
+        check("TG пустая расшифровка: история модели пуста", storage.get(chat).history == [],
+              str(storage.get(chat).history))
+        bodies = incoming_bodies()
+        check("TG пустая расшифровка: в панель ушла запись [Голосовое, не распознано] с файлом",
+              bool(bodies) and "[Голосовое, не распознано]".encode() in bodies[0]
+              and b"_voice.ogg" in bodies[0], str(bodies)[:200])
+        check("TG пустая расшифровка: классификация по пустышке не запускалась",
+              not any(p.endswith("/classify/") for _, p, _ in panel.requests))
+        check("TG пустая расшифровка: ответ бота записан в карточку",
+              any(p.endswith("/tickets/1/messages/") for _, p, _ in panel.requests))
+
+        # --- ошибка расшифровки: общий текст без технических деталей
+        heard["error"] = tr.TranscribeError(
+            "OpenAI: лимит запросов или закончились средства на балансе, ключ sk-secret")
+        fake.clear(); panel.requests.clear()
+        calls_before = len(stub.calls)
+        await feed(make_voice_update("voice", chat, message_id=971))
+        out = " ".join(fake.texts())
+        check("TG ошибка расшифровки: вежливый двуязычный ответ",
+              "Не удалось разобрать голосовое сообщение" in out
+              and "Кайра жибериңиз" in out, out)
+        check("TG ошибка расшифровки: жителю не видно технических деталей",
+              not any(w in out for w in ("OpenAI", "баланс", "ключ", "sk-", "лимит")), out)
+        check("TG ошибка расшифровки: модель не вызвана", len(stub.calls) == calls_before)
+        check("TG ошибка расшифровки: запись всё равно ушла сотруднику",
+              bool(incoming_bodies()) and b"_voice.ogg" in incoming_bodies()[0])
+
+        # --- слишком длинное: отдельный текст «сократите»
+        heard["error"] = tr.TranscribeError("длиннее 10 минут", public_text=tr.TOO_LONG_REPLY)
+        fake.clear()
+        await feed(make_voice_update("voice", chat, message_id=972))
+        check("TG слишком длинная запись: просьба сократить",
+              "сократите" in " ".join(fake.texts()), " ".join(fake.texts()))
+        heard["error"] = RuntimeError("неожиданный сбой")
+        fake.clear()
+        await feed(make_voice_update("voice", chat, message_id=973))
+        check("TG неожиданный сбой расшифровки не роняет бота и не пугает жителя",
+              "Не удалось разобрать" in " ".join(fake.texts())
+              and "неожиданный" not in " ".join(fake.texts()))
+        heard["error"] = None
+
+        # --- сотрудник ведёт разговор: бот молчит и на голосовое
+        heard["text"] = "Где моя справка?"
+        panel.answer_mode = "staff"
+        fake.clear()
+        await feed(make_voice_update("voice", chat, message_id=974))
+        check("TG голосовое в режиме сотрудника: бот молчит",
+              not [c for c in fake.calls if c[0] == "SendMessage"], str(fake.texts()))
+        heard["text"] = ""
+        fake.clear()
+        await feed(make_voice_update("voice", chat, message_id=975))
+        check("TG нераспознанное голосовое в режиме сотрудника: бот тоже молчит",
+              not [c for c in fake.calls if c[0] == "SendMessage"], str(fake.texts()))
+        panel.answer_mode = "ai"
+
+        # --- бот выключен: техработы, расшифровка (платная) не вызывается
+        heard["text"] = "Любой текст"
+        remote.data = {"enabled": False, "maintenance_text": "Идут технические работы."}
+        heard["calls"].clear()
+        fake.clear()
+        await feed(make_voice_update("voice", chat, message_id=976))
+        check("TG голосовое при выключенном боте: текст техработ",
+              "технические работы" in " ".join(fake.texts()).lower(), str(fake.texts()))
+        check("TG голосовое при выключенном боте: расшифровка не вызвана", heard["calls"] == [])
+        remote.data = {}
+
+        # --- файл больше лимита Telegram: вежливый отказ, ничего не скачивается
+        heard["calls"].clear()
+        fake.clear()
+        await feed(make_voice_update("big_voice", chat, message_id=977))
+        check("TG запись > 20 МБ: вежливый отказ",
+              "20 МБ" in " ".join(fake.texts()), str(fake.texts()))
+        check("TG запись > 20 МБ: расшифровка не вызвана", heard["calls"] == [])
+
+        # --- стикер: текст теперь говорит и про голосовые
+        fake.clear()
+        await feed(make_message("/start", chat_id=chat, message_id=978))
+        check("/start упоминает голосовые сообщения", "голосов" in " ".join(fake.texts()).lower())
+        fake.clear()
+        await feed(make_sticker(chat_id=chat))
+        out = " ".join(fake.texts())
+        check("на стикер бот отвечает, что понимает голосовые, а стикеры нет",
+              "голосовые сообщения" in out and "Стикеры" in out, out)
+    finally:
+        tr.transcribe = saved_transcribe
+        bot_module.MEDIA_DIR = saved_media_dir
+        remote.data = {}
+        tmp.cleanup()
+        await client.close()
+        await bot.session.close()
+
+
+async def test_voice_whatsapp() -> None:
+    section("16. WhatsApp: голосовые сообщения")
+    import tempfile
+    from pathlib import Path
+
+    import classify as classify_module
+    import conversation as conversation_module
+    import httpx
+    import transcribe as tr
+    import whatsapp_bot as wa
+
+    # --- разбор вебхука: audio разбирается как image/document
+    payload = {"entry": [{"changes": [{"value": {
+        "contacts": [{"wa_id": "996700123456", "profile": {"name": "Айгуль"}}],
+        "messages": [{"from": "996700123456", "id": "wamid.9", "type": "audio",
+                      "audio": {"id": "MEDIA42", "mime_type": "audio/ogg; codecs=opus",
+                                "sha256": "x", "voice": True}}],
+    }}]}]}
+    parsed = wa.parse_webhook_payload(payload)
+    check("WA вебхук: голосовое разобрано как audio с media_id и mime",
+          len(parsed) == 1 and parsed[0]["type"] == "audio"
+          and parsed[0]["media_id"] == "MEDIA42"
+          and parsed[0]["media_mime"] == "audio/ogg; codecs=opus"
+          and parsed[0]["text"] == "", str(parsed))
+
+    panel = FakePanel()
+    client = connect_fake_panel(panel)
+    stub = StubProvider()
+    stub.answer = "Передали в водоканал."
+    conversation_module.get_provider = lambda name: stub
+    classify_module.get_provider = lambda name: stub
+
+    sent: list[tuple[str, str]] = []
+
+    async def fake_send(phone, text):
+        sent.append((phone, text))
+        return True, ""
+
+    wa.send_whatsapp_text = fake_send
+
+    heard = {"text": "Свет не дают второй день, Сузак", "error": None, "calls": []}
+
+    async def fake_transcribe(path, *, duration=None, mime=None):
+        heard["calls"].append({"path": path, "mime": mime, "exists": Path(path).exists()})
+        if heard["error"]:
+            raise heard["error"]
+        return heard["text"]
+
+    # Двухшаговое скачивание Meta на подставном сервере: media_id -> ссылка -> файл.
+    media_requests: list[tuple[str, str | None]] = []
+
+    def media_handler(request):
+        media_requests.append((str(request.url), request.headers.get("Authorization")))
+        if str(request.url).endswith("/MEDIA42"):
+            return httpx.Response(200, json={"url": "https://lookaside.test/f/42",
+                                             "file_size": 15})
+        if str(request.url) == "https://lookaside.test/f/42":
+            return httpx.Response(200, content=b"OggS-voice-bytes")
+        return httpx.Response(404)
+
+    real_async_client = httpx.AsyncClient
+
+    def patched_client(*args, **kwargs):
+        return real_async_client(*args, transport=httpx.MockTransport(media_handler), **kwargs)
+
+    saved_transcribe = tr.transcribe
+    saved_media_dir = wa.MEDIA_DIR
+    tr.transcribe = fake_transcribe
+    tmp = tempfile.TemporaryDirectory()
+    wa.MEDIA_DIR = Path(tmp.name)
+    httpx.AsyncClient = patched_client
+
+    chat_id = 996700123456
+    phone = str(chat_id)
+    msg = {"phone": phone, "type": "audio", "text": "", "wa_message_id": "w9",
+           "name": "Айгуль", "media_id": "MEDIA42",
+           "media_mime": "audio/ogg; codecs=opus", "media_filename": ""}
+
+    def incoming_bodies():
+        return [body for _, path, body in panel.requests if path.endswith("/tickets/incoming/")]
+
+    try:
+        wa.storage.get(chat_id).clear()
+        wa.storage.get(chat_id).restored = True
+
+        # --- полный диалог: скачали, расшифровали, спросили модель, ответили
+        panel.requests.clear()
+        calls_before = len(stub.calls)
+        await wa.handle_incoming_message(dict(msg))
+        await asyncio.sleep(0.05)
+        check("WA голосовое: файл скачан с токеном Meta на обоих шагах",
+              len(media_requests) == 2
+              and all(auth == "Bearer test-access-token" for _, auth in media_requests),
+              str(media_requests))
+        check("WA голосовое: файл сохранён с расширением .ogg и расшифровке передан mime",
+              bool(heard["calls"]) and heard["calls"][0]["path"].endswith(".ogg")
+              and heard["calls"][0]["exists"]
+              and heard["calls"][0]["mime"] == "audio/ogg; codecs=opus", str(heard["calls"]))
+        sent_to_model = (citizen_part(stub.calls[-1][-1]["content"])
+                         if len(stub.calls) > calls_before else "")
+        check("WA голосовое: модель получила текст с пометкой об автоматической расшифровке",
+              sent_to_model.startswith("[Голосовое сообщение, автоматическая расшифровка")
+              and sent_to_model.endswith(heard["text"]), sent_to_model)
+        check("WA голосовое: житель получил ответ модели",
+              bool(sent) and sent[-1] == (phone, stub.answer), str(sent))
+        bodies = incoming_bodies()
+        check("WA голосовое: в карточку ушла расшифровка с пометкой [Голосовое]",
+              bool(bodies) and f"[Голосовое] {heard['text']}".encode() in bodies[0])
+        check("WA голосовое: сам аудиофайл приложен к карточке",
+              bool(bodies) and b".ogg" in bodies[0] and b"OggS-voice-bytes" in bodies[0])
+        check("WA голосовое: канал в обращении — whatsapp",
+              bool(bodies) and b"whatsapp" in bodies[0])
+
+        # --- пустая расшифровка
+        wa.storage.get(chat_id).clear()
+        heard["text"] = ""
+        sent.clear(); panel.requests.clear(); panel.created = True
+        calls_before = len(stub.calls)
+        await wa.handle_incoming_message(dict(msg))
+        await asyncio.sleep(0.05)
+        out = " ".join(t for _, t in sent)
+        check("WA пустая расшифровка: вежливый двуязычный ответ",
+              "Не удалось разобрать голосовое сообщение" in out
+              and "Үн билдирүүнү түшүнө алган жокмун" in out, out)
+        check("WA пустая расшифровка: модель не вызвана", len(stub.calls) == calls_before)
+        bodies = incoming_bodies()
+        check("WA пустая расшифровка: запись ушла в панель с файлом",
+              bool(bodies) and "[Голосовое, не распознано]".encode() in bodies[0]
+              and b"OggS-voice-bytes" in bodies[0])
+        check("WA пустая расшифровка: классификация по пустышке не запускалась",
+              not any(p.endswith("/classify/") for _, p, _ in panel.requests))
+
+        # --- ошибка расшифровки
+        heard["error"] = tr.TranscribeError("OpenAI: неверный API-ключ sk-secret")
+        sent.clear()
+        calls_before = len(stub.calls)
+        await wa.handle_incoming_message(dict(msg))
+        out = " ".join(t for _, t in sent)
+        check("WA ошибка расшифровки: общий текст без технических деталей",
+              "Не удалось разобрать" in out
+              and not any(w in out for w in ("OpenAI", "ключ", "sk-")), out)
+        check("WA ошибка расшифровки: модель не вызвана", len(stub.calls) == calls_before)
+        heard["error"] = None
+
+        # --- режим сотрудника: бот молчит
+        panel.answer_mode = "staff"
+        heard["text"] = "Где моя справка?"
+        sent.clear()
+        await wa.handle_incoming_message(dict(msg))
+        check("WA голосовое в режиме сотрудника: бот молчит", sent == [], str(sent))
+        panel.answer_mode = "ai"
+
+        # --- бот выключен: расшифровка не вызывается
+        wa.remote.data = {"enabled": False, "maintenance_text": "Идут технические работы."}
+        heard["calls"].clear(); sent.clear()
+        await wa.handle_incoming_message(dict(msg))
+        check("WA голосовое при выключенном боте: текст техработ без расшифровки",
+              heard["calls"] == [] and bool(sent) and "технические работы" in sent[-1][1],
+              str(sent))
+        wa.remote.data = {}
+
+        # --- не удалось скачать файл: просьба повторить, обращение не заводится
+        sent.clear(); panel.requests.clear()
+        bad = dict(msg, media_id="NOPE")
+        await wa.handle_incoming_message(bad)
+        check("WA голосовое, файл не скачался: вежливая просьба повторить",
+              bool(sent) and "голосовое" in sent[-1][1].lower(), str(sent))
+        check("WA голосовое, файл не скачался: обращение не создаётся",
+              incoming_bodies() == [])
+
+        # --- остальные типы по-прежнему получают заглушку, но уже с упоминанием голоса
+        sent.clear()
+        await wa.handle_incoming_message({"phone": phone, "type": "sticker", "text": "",
+                                          "wa_message_id": "w10", "name": ""})
+        check("WA стикер: заглушка упоминает голосовые сообщения",
+              bool(sent) and "голосовые" in sent[-1][1], str(sent))
+    finally:
+        httpx.AsyncClient = real_async_client
+        tr.transcribe = saved_transcribe
+        wa.MEDIA_DIR = saved_media_dir
+        wa.remote.data = {}
+        tmp.cleanup()
+        await client.close()
+
+
+# ===========================================================================
+
+# ===========================================================================
+# 17. Справочник в ответе и поиск в интернете (conversation.py, без сети)
+# ===========================================================================
+
+class FakeKnowledge:
+    """Подставной справочник с интерфейсом knowledge.KnowledgeBase."""
+
+    enabled = True
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+        self.delay = 0.0
+        self.error: Exception | None = None
+
+    async def search(self, query, embed=None, territory_hint="", limit=5):
+        self.calls.append((query, embed, territory_hint))
+        if self.error:
+            raise self.error
+        if self.delay and embed is not None:
+            await asyncio.sleep(self.delay)
+        return ["hit"]
+
+    async def search_constitution(self, query, embed=None, limit=2):
+        return []
+
+    def candidate_organizations(self, hits):
+        return [{"id": "org-1", "name": "Водоканал Ноокен"}]
+
+    def format_context(self, hits, arts=None, max_chars=2400):
+        return "Справочник (проверенные данные):\n1. Водоканал Ноокен. Тел.: 0372 50000"
+
+
+class SearchStub(StubProvider):
+    """Подставной OpenAI с поиском: отвечает из списка, поиск — отдельно."""
+
+    def __init__(self, answers: list[str], found: str | Exception = "Найдено в интернете."):
+        super().__init__()
+        self.answers = list(answers)
+        self.found = found
+        self.search_systems: list[str] = []
+
+    async def ask(self, system, history, max_tokens, detailed):
+        self.calls.append([dict(m) for m in history])
+        self.systems.append(system)
+        item = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    async def search_web(self, system, history, max_tokens):
+        self.search_systems.append(system)
+        if isinstance(self.found, Exception):
+            raise self.found
+        return self.found
+
+
+async def test_assistant_pipeline() -> None:
+    section("17. Справочник и поиск в интернете (conversation.py)")
+    import conversation as conversation_module
+    import prompts
+    from providers import ProviderError, reset_availability
+    from storage import Session
+
+    conv = conversation_module
+
+    # --- служебная строка «ПОИСК:»
+    cases = {
+        "ПОИСК: график ЦОН Ноокен": "график ЦОН Ноокен",
+        "**ПОИСК:** адрес мэрии": "адрес мэрии",
+        "Секунду.\nПОИСК: телефон ЦСМ Масы": "телефон ЦСМ Масы",
+        "ПОИСК:": "",
+        "Здравствуйте! Чем помочь?": None,
+        "Мы ведём ПОИСК: решения": None,
+    }
+    for text, expected in cases.items():
+        check(f"разбор «ПОИСК:»: {text[:24]!r}", prompts.parse_search_request(text) == expected,
+              repr(prompts.parse_search_request(text)))
+
+    # --- справочные блоки приклеиваются к вопросу, история сессии не меняется
+    history = [{"role": "user", "content": "старый вопрос"},
+               {"role": "assistant", "content": "ответ"},
+               {"role": "user", "content": "нет воды", "images": ["a.jpg"]}]
+    out = conv.with_context(history, knowledge="Справочник: Водоканал", citizen="ФИО — Асанов")
+    check("блоки справочника перед вопросом жителя",
+          out[-1]["content"].startswith("[Справочник: Водоканал]")
+          and "[О жителе: ФИО — Асанов]" in out[-1]["content"]
+          and out[-1]["content"].endswith("[Сообщение жителя]\nнет воды"), out[-1]["content"])
+    check("история сессии не меняется", history[-1]["content"] == "нет воды")
+    check("фото к вопросу сохраняются", out[-1].get("images") == ["a.jpg"])
+    check("без блоков — та же история", conv.with_context(history) is history)
+    check("начало переписки не меняется (кэш промпта OpenAI)", out[:2] == history[:2])
+
+    # --- текст для поиска
+    check("служебные пометки не идут в поиск",
+          conv.strip_service("[Голосовое сообщение, автоматическая расшифровка — "
+                             "возможны ошибки распознавания] суу жок") == "суу жок")
+    short = [{"role": "user", "content": "В Масы нет воды"},
+             {"role": "assistant", "content": "Понял"},
+             {"role": "user", "content": "а куда звонить?"}]
+    check("короткий вопрос ищется вместе с предыдущим",
+          conv.search_query(short) == "В Масы нет воды а куда звонить?", conv.search_query(short))
+    long_q = "Подскажите, как получить земельный участок в Токтогульском районе"
+    check("длинный вопрос ищется сам по себе",
+          conv.search_query(short + [{"role": "user", "content": long_q}]) == long_q)
+
+    # --- поиск по справочнику
+    saved = conv._knowledge, conv._embed, conv.LOOKUP_TIMEOUT
+    kb = FakeKnowledge()
+    conv._knowledge, conv._embed = kb, "EMBED"
+    session = Session(provider="openai")
+    session.add("user", "нет воды", 20)
+    session.known.update(district_name="Ноокенский район", settlement="Масы")
+    text = await conv.knowledge_context(session, "chat")
+    check("справочник: блок найден", "Водоканал Ноокен" in text, text)
+    check("справочник: район и село подсказаны поиску",
+          kb.calls and kb.calls[-1][2] == "Ноокенский район, Масы", str(kb.calls))
+    check("справочник: кандидаты в исполнители запомнены",
+          session.candidates == [{"id": "org-1", "name": "Водоканал Ноокен"}], str(session.candidates))
+
+    kb.delay = 5
+    conv.LOOKUP_TIMEOUT = 0.05
+    kb.calls.clear()
+    text = await conv.knowledge_context(session, "chat")
+    check("справочник: долгий смысловой поиск -> только по словам",
+          bool(text) and kb.calls[-1][1] is None, str(kb.calls))
+    kb.delay = 0
+    kb.error = RuntimeError("сломался индекс")
+    check("справочник: сбой поиска не мешает ответу", await conv.knowledge_context(session, "chat") == "")
+    kb.error = None
+    empty = Session(provider="openai")
+    check("справочник: нет вопроса — нет поиска", await conv.knowledge_context(empty, "chat") == "")
+    conv._knowledge = None
+    check("справочник не подключён — ответ без него",
+          await conv.knowledge_context(session, "chat") == "")
+    conv._knowledge, conv._embed, conv.LOOKUP_TIMEOUT = saved
+
+    # --- поиск в интернете по требованию модели
+    saved_get, saved_has = conv.get_provider, conv.has_key
+    reset_availability()
+
+    async def run(stub, preferred="openai"):
+        conv.get_provider = lambda name: stub
+        return await conv.ask_assistant(preferred, "SYSTEM", [{"role": "user", "content": "q"}], 500, False)
+
+    stub = SearchStub(["Обычный ответ."])
+    answer, by = await run(stub)
+    check("поиск: обычный ответ отдаётся как есть, без поиска",
+          answer == "Обычный ответ." and not stub.search_systems)
+
+    stub = SearchStub(["ПОИСК: график работы ЦОН Ноокен"], found="ЦОН работает с 9 до 18. Источник: tunduk.gov.kg")
+    answer, by = await run(stub)
+    check("поиск: запрос модели уходит в поиск", answer.startswith("ЦОН работает"), answer)
+    check("поиск: запрос подставлен в правила поиска",
+          stub.search_systems and "график работы ЦОН Ноокен" in stub.search_systems[0]
+          and "официальные источники" in stub.search_systems[0], str(stub.search_systems)[:200])
+    check("поиск: житель не видит служебную строку", "ПОИСК" not in answer)
+    check("поиск: модель чата не переключается из-за поиска", by == "openai")
+
+    stub = SearchStub(["ПОИСК: телефон ЦСМ", "Точных данных нет, уточните в ЦСМ."],
+                      found=ProviderError("поиск недоступен", retryable=True))
+    answer, by = await run(stub)
+    check("поиск сломался -> честный ответ без поиска",
+          answer == "Точных данных нет, уточните в ЦСМ.", answer)
+    check("повторный запрос знает, что поиска нет", "Поиск в интернете сейчас недоступен" in stub.systems[-1])
+
+    stub = SearchStub(["ПОИСК: x"], found="ПОИСК: y")
+    answer, _ = await run(stub)
+    check("модель упорно просит поиск -> безопасная заглушка", answer == conv.NO_DATA_TEXT, answer)
+
+    stub = SearchStub(["ПОИСК: x", ProviderError("лимит", retryable=True)],
+                      found=ProviderError("нет поиска"))
+    answer, _ = await run(stub)
+    check("сбой повторного запроса не показывается жителю", answer == conv.NO_DATA_TEXT, answer)
+
+    conv.has_key = lambda name: False
+    stub = SearchStub(["ПОИСК: x", "Ответ без поиска."])
+    answer, _ = await run(stub)
+    check("нет ключа OpenAI -> без поиска, без служебной строки",
+          answer == "Ответ без поиска." and not stub.search_systems, answer)
+    conv.get_provider, conv.has_key = saved_get, saved_has
+
+    # --- поиск у OpenAI: инструмент, страна, разметка ссылок (без сети)
+    import types
+
+    import httpx
+    import openai
+    from providers.openai_provider import OpenAIProvider, plain_links
+
+    created: list[dict] = []
+
+    async def fake_create(**kwargs):
+        created.append(kwargs)
+        if len(created) == 1 and kwargs["tools"][0].get("user_location"):
+            raise openai.BadRequestError(
+                "user_location not supported",
+                response=httpx.Response(400, request=httpx.Request("POST", "https://api.openai.com")),
+                body=None)
+        return types.SimpleNamespace(
+            output_text="ЦОН: пн-пт ([tunduk.gov.kg](https://tunduk.gov.kg/a?utm_source=openai)). **Важно**.")
+
+    provider = OpenAIProvider()
+    provider._client = types.SimpleNamespace(responses=types.SimpleNamespace(create=fake_create))
+    text = await provider.search_web("SYS", [{"role": "user", "content": "где ЦОН", "images": ["x.jpg"]}], 900)
+    check("OpenAI-поиск: инструмент web_search с привязкой к Кыргызстану",
+          created[0]["tools"][0]["type"] == "web_search"
+          and created[0]["tools"][0]["user_location"]["country"] == "KG", str(created[0]["tools"]))
+    check("OpenAI-поиск: при отказе уточнений — голый поиск",
+          len(created) == 2 and created[1]["tools"] == [{"type": "web_search"}], str(created[-1:]))
+    check("OpenAI-поиск: фото в поиск не передаются",
+          all("images" not in m for m in created[-1]["input"]), str(created[-1]["input"]))
+    check("OpenAI-поиск: ссылки и выделение — обычным текстом",
+          text == "ЦОН: пн-пт (https://tunduk.gov.kg/a). Важно.", text)
+    check("ссылка с подписью сохраняет подпись",
+          plain_links("[Портал](https://portal.kg/?a=1&utm_source=openai)") == "Портал (https://portal.kg/?a=1)")
+
+
+# ===========================================================================
+# 18. Номер телефона, геометка, смена заявки (Telegram и WhatsApp)
+# ===========================================================================
+
+def make_contact(chat_id: int, phone: str, user_id: int | None, message_id: int):
+    import datetime
+
+    from aiogram.types import Chat, Contact, Message, Update, User
+
+    msg = Message(
+        message_id=message_id,
+        date=datetime.datetime.now(),
+        chat=Chat(id=chat_id, type="private"),
+        from_user=User(id=chat_id, is_bot=False, first_name="Житель"),
+        contact=Contact(phone_number=phone, first_name="Бакыт", user_id=user_id),
+    )
+    return Update(update_id=message_id, message=msg)
+
+
+def make_location(chat_id: int, lat: float, lon: float, message_id: int):
+    import datetime
+
+    from aiogram.types import Chat, Location, Message, Update, User
+
+    msg = Message(
+        message_id=message_id,
+        date=datetime.datetime.now(),
+        chat=Chat(id=chat_id, type="private"),
+        from_user=User(id=chat_id, is_bot=False, first_name="Житель"),
+        location=Location(latitude=lat, longitude=lon),
+    )
+    return Update(update_id=message_id, message=msg)
+
+
+async def test_contact_location() -> None:
+    section("18. Номер телефона, геометка, смена заявки")
+    import json as _json
+
+    import bot as bot_module
+    import classify as classify_module
+    import conversation as conversation_module
+    import whatsapp_bot as wa
+    from aiogram import Bot
+
+    await settle()
+    panel = FakePanel()
+    client = connect_fake_panel(panel)
+    fake = FakeTelegram()
+    bot = Bot(token=os.environ["TELEGRAM_BOT_TOKEN"], session=fake.build_session())
+    stub = StubProvider()
+    conversation_module.get_provider = lambda name: stub
+    classify_module.get_provider = lambda name: stub
+    dp, storage = bot_module.dp, bot_module.storage
+
+    async def feed(update):
+        await dp.feed_update(bot, update)
+        await settle()
+
+    def markups():
+        return [c[1].get("reply_markup") for c in fake.calls if c[0] == "SendMessage"]
+
+    chat = 700
+    storage.get(chat).clear()
+    storage.get(chat).restored = True
+
+    # --- бот просит номер -> кнопка «Отправить номер телефона»
+    check("просьба номера распознаётся",
+          bot_module.asks_for_phone("Напишите, пожалуйста, ваш номер телефона для связи.")
+          and bot_module.asks_for_phone("Байланыш үчүн телефон номериңизди жазыңыз.")
+          and not bot_module.asks_for_phone("Звоните в мэрию: 0372 5-00-00."))
+    stub.answer = "Чтобы передать обращение, напишите ваш номер телефона."
+    fake.clear()
+    await feed(make_message("Нет света третий день", chat_id=chat, message_id=40))
+    kb = markups()[-1] if markups() else None
+    check("TG: под просьбой номера — кнопка запроса контакта",
+          bool(kb) and kb.get("keyboard") and kb["keyboard"][0][0].get("request_contact") is True,
+          str(kb))
+
+    # --- житель нажал кнопку: номер в профиль, кнопка убирается
+    stub.answer = "Спасибо, номер получен. Обращение передано."
+    fake.clear(); panel.requests.clear()
+    await feed(make_contact(chat, "+996 555 12-34-56", user_id=chat, message_id=41))
+    session = storage.get(chat)
+    check("TG: свой номер запомнен как подтверждённый",
+          session.known.get("phone") == "996555123456"
+          and session.known.get("phone_source") == "shared", str(session.known))
+    incoming = [body for _, p, body in panel.requests if p.endswith("/tickets/incoming/")]
+    check("TG: номер ушёл в профиль жителя в панели",
+          bool(incoming) and b"996555123456" in incoming[0], str(incoming)[:200])
+    check("TG: модель знает, что номер получен",
+          "номер телефона кнопкой" in citizen_part(stub.calls[-1][-1]["content"]))
+    kb = markups()[-1] if markups() else None
+    check("TG: после номера кнопка убирается", bool(kb) and kb.get("remove_keyboard") is True, str(kb))
+    check("TG: модель больше не спрашивает номер",
+          "номер телефона известен" in stub.calls[-1][-1]["content"])
+
+    # --- чужой контакт — просто номер из переписки
+    other_chat = 701
+    storage.get(other_chat).clear()
+    storage.get(other_chat).restored = True
+    await feed(make_contact(other_chat, "0555 99 88 77", user_id=999, message_id=42))
+    check("TG: чужой контакт не считается подтверждённым номером жителя",
+          storage.get(other_chat).known.get("phone_source") == "stated",
+          str(storage.get(other_chat).known))
+
+    # --- геометка: координаты в карточку, модель не переспрашивает улицу
+    panel.requests.clear()
+    await feed(make_location(chat, 41.1234567, 72.7654321, message_id=43))
+    pins = [b for b in classify_bodies(panel) if "lat" in b]
+    check("TG: геометка ушла в карточку координатами",
+          bool(pins) and abs(pins[0]["lat"] - 41.1234567) < 1e-9
+          and abs(pins[0]["lon"] - 72.7654321) < 1e-9, str(pins))
+    check("TG: в переписке карточки — координаты точки",
+          any(b"41.123457" in body for _, p, body in panel.requests if p.endswith("/incoming/")))
+    check("TG: модель знает, что место отмечено",
+          "точку на карте" in stub.calls[-1][-1]["content"])
+
+    # --- панель завела новую заявку: тема и место заново, ФИО и номер остаются
+    session.known.update(last_name="Асанов", kind="appeal", settlement="Масы")
+    panel.ticket_id = 9
+    await feed(make_message("Другое: у школы яма на дороге", chat_id=chat, message_id=44))
+    check("TG: новая заявка — бот ведёт её",
+          session.ticket_id == 9, str(session.ticket_id))
+    check("TG: при новой заявке место забыто, ФИО и номер — нет",
+          session.known.get("last_name") == "Асанов" and session.known.get("phone") == "996555123456"
+          and session.known.get("settlement") != "Масы", str(session.known))
+    check("TG: id сообщения в панели привязан к истории",
+          any(m.get("crm_id") == panel.message_id for m in session.history), str(session.history[-2:]))
+
+    # --- WhatsApp: номер известен всегда, геометка из вебхука
+    payload = {"entry": [{"changes": [{"value": {
+        "contacts": [{"wa_id": "996700555444", "profile": {"name": "Гулзат"}}],
+        "messages": [{"from": "996700555444", "id": "wamid.L", "type": "location",
+                      "location": {"latitude": 41.2, "longitude": 72.9,
+                                   "name": "Мектеп №3", "address": "Масы айылы"}}]}}]}]}
+    parsed = wa.parse_webhook_payload(payload)
+    check("WA: геометка разобрана из вебхука",
+          parsed and parsed[0]["location"] == (41.2, 72.9)
+          and parsed[0]["text"] == "Мектеп №3, Масы айылы", str(parsed))
+
+    sent: list[tuple[str, str]] = []
+
+    async def fake_send(phone, text):
+        sent.append((phone, text))
+        return True, ""
+
+    wa.send_whatsapp_text = fake_send
+    phone_chat = 996700555444
+    wa.storage.get(phone_chat).clear()
+    wa.storage.get(phone_chat).restored = True
+    panel.ticket_id = 1
+    panel.requests.clear()
+    stub.answer = "Место получили, передаём."
+    await wa.handle_incoming_message(parsed[0])
+    await settle()
+    wa_session = wa.storage.get(phone_chat)
+    check("WA: номер жителя известен из канала",
+          wa_session.known.get("phone") == "996700555444"
+          and wa_session.known.get("phone_source") == "channel", str(wa_session.known))
+    check("WA: модель не спрашивает номер",
+          "номер телефона известен" in stub.calls[-1][-1]["content"])
+    pins = [b for b in classify_bodies(panel) if "lat" in b]
+    check("WA: геометка ушла в карточку", bool(pins) and pins[0]["lat"] == 41.2, str(pins))
+    check("WA: название места дошло до модели",
+          "Мектеп №3" in citizen_part(stub.calls[-1][-1]["content"]))
+    check("WA: житель получил ответ", bool(sent) and sent[-1][1] == stub.answer, str(sent))
+
+    await client.close()
+
+
+async def test_knowledge_module() -> None:
+    """19. Справочник организаций (knowledge.py) — проверки живут в своём файле."""
+    from selftest_knowledge import test_knowledge
+    await test_knowledge(check, section)
+
 
 async def main() -> int:
     for test in (test_config, test_split, test_icons, test_prompts, test_storage,
@@ -1493,7 +2710,10 @@ async def main() -> int:
     for test in (test_dialog, test_providers_offline,
                  test_crm_client, test_dialog_with_panel,
                  test_whatsapp_webhook, test_whatsapp_dialog_with_panel,
-                 test_whatsapp_outbox, test_retitle):
+                 test_whatsapp_outbox, test_update_ticket,
+                 test_transcribe_module, test_voice_telegram,
+                 test_voice_whatsapp, test_assistant_pipeline,
+                 test_contact_location, test_knowledge_module):
         try:
             await test()
         except Exception:

@@ -16,6 +16,7 @@ bot.py — точка входа. Здесь живёт вся логика Tele
 import asyncio
 import contextlib
 import logging
+import re
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatAction
@@ -33,12 +34,23 @@ from aiogram.types import (
     ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 
-from classify import classify_ticket, refine_ticket
+import transcribe as transcribe_module
+from classify import describe_known, forget_ticket, update_ticket
 from config import settings
-from conversation import ask_with_fallback, restore_history
+from conversation import (
+    ask_assistant,
+    background,
+    init_knowledge,
+    knowledge_context,
+    restore_history,
+    with_context,
+)
 from crm import crm
 from icons import ICONS, clean_text
 from logging_setup import setup_logging
@@ -50,6 +62,11 @@ from providers import (
     warm_up,
 )
 from storage import MODE_TITLES, PROVIDER_TITLES, Mode, Storage
+from transcribe import (
+    UNRECOGNIZED_CARD_TEXT,
+    UNRECOGNIZED_REPLY,
+    TranscribeError,
+)
 from utils import split_text
 
 logger = logging.getLogger(__name__)
@@ -120,10 +137,46 @@ def rating_keyboard(crm_message_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
-def _profile(message: Message) -> dict:
+# Telegram, в отличие от WhatsApp, номер жителя не сообщает. Когда бот
+# просит телефон, под ответом появляется кнопка: одно касание — и номер
+# пришёл без ошибок набора, а житель не диктует его вручную.
+CONTACT_BUTTON_TEXT = "Отправить номер телефона / Номерди жөнөтүү"
+
+
+def contact_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=CONTACT_BUTTON_TEXT, request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+# «Напишите ваш номер», «оставьте телефон для связи», «телефон номериңизди
+# жазыңыз». Номер учреждения в ответе («звоните 0372 5...») сюда не попадает:
+# нужна именно просьба назвать СВОЙ номер.
+_ASKS_PHONE_RE = re.compile(
+    r"ваш\w*\s+(?:контактн\w*\s+)?(?:номер|телефон)"
+    r"|(?:укаж|напиш|оставь|сообщ|назов|отправ|пришл|подел)\w*[^.?!\n]{0,40}(?:номер|телефон)"
+    r"|номер\w*\s+(?:вашего\s+)?телефона\s+для\s+связи"
+    r"|(?:номер|номур|телефон)\w*ң[ыиуү]з"
+    r"|байланыш\w*\s+үчүн[^.?!\n]{0,40}(?:номер|телефон)",
+    re.IGNORECASE,
+)
+
+
+def asks_for_phone(text: str) -> bool:
+    """Ответ бота просит у жителя номер телефона?"""
+    return bool(_ASKS_PHONE_RE.search(text or ""))
+
+
+def _digits(raw: str | None) -> str:
+    return "".join(ch for ch in (raw or "") if ch.isdigit())
+
+
+def _profile(message: Message, session=None) -> dict:
     """Данные жителя для панели."""
     user = message.from_user
-    return {
+    profile = {
         "channel": "telegram",
         "tg_user_id": user.id if user else message.chat.id,
         "chat_id": message.chat.id,
@@ -131,6 +184,11 @@ def _profile(message: Message) -> dict:
         "last_name": (user.last_name if user else "") or "",
         "username": (user.username if user else "") or "",
     }
+    # Номер, присланный кнопкой, — проверенный самим Telegram: шлём его в
+    # профиль. Продиктованный в тексте уходит иначе — через classify.py.
+    if session is not None and session.known.get("phone_source") == "shared":
+        profile["phone"] = session.known["phone"]
+    return profile
 
 
 # ------------------------------------------------------------ вспомогательное
@@ -227,7 +285,8 @@ async def cmd_start(message: Message) -> None:
         "Привет! Я мост между тобой и ИИ.\n\n"
         f"{ICONS.bullet} Модель: {PROVIDER_TITLES[session.provider]}\n"
         f"{ICONS.bullet} Режим: {MODE_TITLES[session.mode]}\n\n"
-        "Просто напиши мне вопрос — и я отвечу.\n\n"
+        "Просто напиши мне вопрос — и я отвечу. Можно текстом или голосовым "
+        "сообщением.\n\n"
         "Команды:\n"
         f"{ICONS.dot} /mode — переключить режим ответа\n"
         f"{ICONS.dot} /model — переключить ИИ\n"
@@ -246,6 +305,8 @@ async def cmd_help(message: Message) -> None:
         "с объяснениями и примерами. Для «объясни тему», «напиши код», «разбери задачу».\n\n"
         f"{MODE_TITLES[Mode.CHAT]}\nЖивой диалог: короткие реплики на 1-3 предложения, "
         "встречные вопросы и комментарии. Для обсуждения и брейншторма.\n\n"
+        "Вопрос можно написать текстом или наговорить голосовым сообщением "
+        "(по-русски или по-кыргызски), а также прислать фото и документы.\n\n"
         "Бот помнит контекст переписки, поэтому можно задавать уточняющие вопросы "
         "вроде «а подробнее?». Чтобы начать тему с нуля — /reset.\n\n"
         "Команды: /mode, /model, /reset, /status"
@@ -418,10 +479,130 @@ async def handle_media(message: Message, bot: Bot) -> None:
                   file_paths=[str(path)], citizen_text=caption, image_paths=image_paths)
 
 
+@dp.message(F.voice | F.audio | F.video_note)
+async def handle_voice(message: Message, bot: Bot) -> None:
+    """
+    Голосовое сообщение, аудиофайл или видеокружок от жителя.
+
+    Звук скачивается, расшифровывается (см. transcribe.py) и дальше идёт тем
+    же путём, что и текст: в панель уходят и расшифровка, и сам файл —
+    сотрудник может перепроверить на слух, ведь распознавание ошибается,
+    особенно на смеси русского и кыргызского. Модель получает расшифровку
+    с пометкой, что это автоматический текст и в нём возможны ошибки.
+
+    Если речь разобрать не удалось, житель получает вежливую просьбу
+    повторить, а запись всё равно уходит в панель: обращение не теряется.
+    """
+    if not remote.bot_enabled:
+        # Бот выключен в панели: respond() ответит текстом техработ,
+        # а платить за расшифровку и скачивать файл незачем.
+        await respond(message, bot, UNRECOGNIZED_CARD_TEXT)
+        return
+
+    if message.voice:
+        tg_file, ext = message.voice, ".ogg"
+    elif message.audio:
+        tg_file = message.audio
+        ext = (Path(message.audio.file_name or "").suffix.lower()
+               or transcribe_module.ext_for_mime(message.audio.mime_type) or ".mp3")
+    else:
+        tg_file, ext = message.video_note, ".mp4"
+    mime = getattr(tg_file, "mime_type", None)
+    duration = getattr(tg_file, "duration", None)
+
+    if tg_file.file_size and tg_file.file_size > 20 * 1024 * 1024:
+        await message.answer(
+            f"{ICONS.error}  Запись больше 20 МБ — Telegram не даёт ботам "
+            "скачивать такие. Пришли, пожалуйста, покороче или напиши текстом."
+        )
+        return
+
+    MEDIA_DIR.mkdir(exist_ok=True)
+    path = MEDIA_DIR / f"{message.chat.id}_{message.message_id}_voice{ext}"
+    try:
+        await bot.download(tg_file, destination=path)
+    except Exception:
+        logger.exception("Не удалось скачать голосовое из Telegram")
+        await message.answer(
+            f"{ICONS.error}  Не получилось принять запись. Попробуй ещё раз "
+            "или напиши текстом."
+        )
+        return
+
+    reply = UNRECOGNIZED_REPLY
+    text = ""
+    try:
+        async with typing(bot, message.chat.id):
+            text = await transcribe_module.transcribe(
+                str(path), duration=duration, mime=mime)
+    except TranscribeError as e:
+        # Детали (ключ, баланс, сеть) — только в лог; жителю — общий текст.
+        logger.warning("Расшифровка голосового не удалась: %s", e.message)
+        COUNTERS["errors"] += 1
+        reply = e.public_text or UNRECOGNIZED_REPLY
+    except Exception:
+        logger.exception("Сбой расшифровки голосового")
+        COUNTERS["errors"] += 1
+
+    if not text:
+        await respond(message, bot, UNRECOGNIZED_CARD_TEXT,
+                      file_paths=[str(path)], fixed_reply=f"{ICONS.info}  {reply}")
+        return
+
+    model_text = ("[Голосовое сообщение, автоматическая расшифровка — "
+                  f"возможны ошибки распознавания] {text}")
+    await respond(message, bot, model_text,
+                  file_paths=[str(path)], citizen_text=f"[Голосовое] {text}")
+
+
+@dp.message(F.contact)
+async def handle_contact(message: Message, bot: Bot) -> None:
+    """
+    Житель нажал «Отправить номер телефона» (или прислал чей-то контакт).
+
+    Свой номер Telegram подтверждает сам — такой номер надёжнее любого
+    продиктованного, он уходит в профиль жителя в панели. Чужой контакт
+    («вот номер соседа») — просто номер, названный в переписке.
+    """
+    contact = message.contact
+    phone = _digits(contact.phone_number)
+    if not phone:
+        await handle_other(message)
+        return
+    own = bool(message.from_user and contact.user_id == message.from_user.id)
+    session = storage.get(message.chat.id)
+    if own:
+        session.known["phone"], session.known["phone_source"] = phone, "shared"
+        note = "[Житель отправил свой номер телефона кнопкой — номер получен]"
+    else:
+        if not session.known.get("phone"):
+            session.known["phone"], session.known["phone_source"] = phone, "stated"
+        name = " ".join(x for x in (contact.first_name, contact.last_name) if x)
+        note = f"[Житель прислал контакт: {name or 'без имени'}, +{phone}]"
+    await respond(message, bot, note, citizen_text=f"[Номер телефона] +{phone}")
+
+
+@dp.message(F.location)
+async def handle_location(message: Message, bot: Bot) -> None:
+    """
+    Житель отправил точку на карте — самый точный «адрес» из возможных.
+
+    Координаты уходят в карточку (панель ставит заявку на карту и сама
+    определяет район по границам), модели — пометка, чтобы она не
+    переспрашивала улицу и дом.
+    """
+    location = message.location
+    lat, lon = location.latitude, location.longitude
+    await respond(message, bot, "[Житель отправил точку на карте — место отмечено]",
+                  citizen_text=f"[Геометка] {lat:.6f}, {lon:.6f}", pin=(lat, lon))
+
+
 async def respond(message: Message, bot: Bot, user_text: str,
                   file_paths: list[str] | None = None,
                   citizen_text: str | None = None,
-                  image_paths: list[str] | None = None) -> None:
+                  image_paths: list[str] | None = None,
+                  fixed_reply: str | None = None,
+                  pin: tuple[float, float] | None = None) -> None:
     """
     Общий путь любого обращения: панель -> (готовый ответ | модель) -> житель.
 
@@ -429,6 +610,11 @@ async def respond(message: Message, bot: Bot, user_text: str,
     отличается от текста для модели (случай фотографии).
     image_paths — пути к фото, которые нужно реально показать модели
     (vision), а не просто прикрепить к карточке (см. file_paths).
+    fixed_reply — готовый ответ вместо обращения к модели (случай нераспознанного
+    голосового): обращение с файлом всё равно попадает в панель, и если
+    разговор ведёт сотрудник, бот по-прежнему молчит. В историю модели такая
+    реплика не попадает — спрашивать у ИИ там нечего.
+    pin — координаты точки, которую житель отправил с карты.
     """
     session = storage.get(message.chat.id)
     COUNTERS["messages"] += 1
@@ -460,41 +646,47 @@ async def respond(message: Message, bot: Bot, user_text: str,
         #    диалог: ИИ или сотрудник. Панель лежит — обращение в очереди
         #    на диске, а житель всё равно получит ответ ИИ.
         record = await crm.incoming(
-            _profile(message),
+            _profile(message, session),
             citizen_text if citizen_text is not None else user_text,
             tg_message_id=message.message_id,
             file_paths=file_paths,
         )
+        crm_id = None
         if record:
-            session.ticket_id = record.get("ticket_id")
-            if record.get("created") and session.ticket_id:
-                # Новая карточка — фоново определяем тему. Ответа не ждём.
-                asyncio.create_task(classify_ticket(
-                    crm, session.ticket_id, user_text, session.provider))
-                # И ещё раз, через несколько минут — по уже сложившейся
-                # переписке (заголовок и адрес/район), а не по одной фразе «привет».
-                asyncio.create_task(refine_ticket(
-                    crm, session.ticket_id, session.provider))
+            _follow_ticket(session, record)
+            crm_id = session.last_message_id
+            if pin and session.ticket_id:
+                session.known["pin"] = True
+                background(crm.classify(session.ticket_id,
+                                        {"lat": pin[0], "lon": pin[1]}))
             if record.get("answer_mode") == "staff":
                 # Разговор перехватил сотрудник: ИИ молчит, ответ придёт
                 # через очередь исходящих. Историю ИИ не трогаем.
                 return
+
+        if fixed_reply is not None:
+            await _deliver_answer(message, session, fixed_reply)
+            return
 
         # 5. Готовый ответ из панели — отдаём дословно, модель не зовём.
         quick = remote.match_quick_answer(user_text)
         if quick:
             COUNTERS["quick_answers"] += 1
             answer = quick["answer"]
-            session.add("user", user_text, settings.history_limit, images=image_paths)
+            session.add("user", user_text, settings.history_limit,
+                        images=image_paths, crm_id=crm_id)
             session.add("assistant", answer, settings.history_limit)
             if quick.get("id"):
-                asyncio.create_task(crm.answer_hit(quick["id"]))
+                background(crm.answer_hit(quick["id"]))
             await _deliver_answer(message, session, answer)
+            _after_answer(session)
             return
 
         # 6. Кладём вопрос в историю и спрашиваем модель. Промпт собирается
-        #    из данных панели: тексты, справочник контактов, режим фактов.
-        session.add("user", user_text, settings.history_limit, images=image_paths)
+        #    из данных панели; к самому вопросу подклеиваем найденное в
+        #    справочнике и то, что уже известно о жителе.
+        session.add("user", user_text, settings.history_limit,
+                    images=image_paths, crm_id=crm_id)
 
         detailed = session.mode is Mode.DETAILED
         system = build_system(
@@ -507,10 +699,13 @@ async def respond(message: Message, bot: Bot, user_text: str,
 
         try:
             async with typing(bot, message.chat.id):
-                answer, answered_by = await ask_with_fallback(
+                knowledge = await knowledge_context(session, session.mode)
+                history = with_context(session.history, knowledge=knowledge,
+                                       citizen=describe_known(session.known))
+                answer, answered_by = await ask_assistant(
                     preferred=session.provider,
                     system=system,
-                    history=session.history,
+                    history=history,
                     max_tokens=max_tokens,
                     detailed=detailed,
                 )
@@ -550,6 +745,29 @@ async def respond(message: Message, bot: Bot, user_text: str,
         session.add("assistant", answer, settings.history_limit)
         COUNTERS["answers"] += 1
         await _deliver_answer(message, session, answer)
+        _after_answer(session)
+
+
+def _follow_ticket(session, record: dict) -> None:
+    """
+    Запомнить, в какую заявку попало сообщение.
+
+    Панель могла завести новую заявку (прошлую закрыл сотрудник или она была
+    справочной и житель долго молчал) — тогда тема, место и исполнитель
+    начинаются заново, а ФИО и телефон остаются (см. classify.forget_ticket).
+    """
+    ticket_id = record.get("ticket_id")
+    if ticket_id and session.ticket_id and ticket_id != session.ticket_id:
+        forget_ticket(session)
+    if ticket_id:
+        session.ticket_id = ticket_id
+    session.last_message_id = record.get("message_id")
+
+
+def _after_answer(session) -> None:
+    """После ответа — фоново дозаполнить карточку по переписке."""
+    if session.ticket_id:
+        background(update_ticket(crm, session, session.provider))
 
 
 async def _deliver_answer(message: Message, session, answer: str) -> None:
@@ -557,13 +775,20 @@ async def _deliver_answer(message: Message, session, answer: str) -> None:
     Отправить ответ жителю и записать его в карточку.
 
     Если панель приняла запись, под ответом появляются кнопки оценки —
-    они привязаны к сообщению в карточке.
+    они привязаны к сообщению в карточке. Если бот просит телефон, а номер
+    ещё неизвестен, вместо них — кнопка «Отправить номер телефона»; когда
+    номер получен, эта кнопка убирается.
     """
     crm_message_id = None
     if session.ticket_id:
         crm_message_id = await crm.ai_message(session.ticket_id, answer)
     markup = (rating_keyboard(crm_message_id)
               if crm_message_id and RATING_BUTTONS_ENABLED else None)
+    if not session.known.get("phone") and asks_for_phone(answer):
+        markup = contact_keyboard()
+        session.known["contact_keyboard"] = True
+    elif session.known.get("phone") and session.known.pop("contact_keyboard", None):
+        markup = ReplyKeyboardRemove()
     await send_long(message, answer, reply_markup=markup)
 
 
@@ -588,10 +813,10 @@ async def rate_answer(callback: CallbackQuery) -> None:
 
 @dp.message()
 async def handle_other(message: Message) -> None:
-    """Стикеры, голосовые и прочее — бот работает с текстом, фото и файлами."""
+    """Стикеры и прочее — бот работает с текстом, голосовыми, фото и файлами."""
     await message.answer(
-        f"{ICONS.info}  Я понимаю текст, фотографии и документы. "
-        "Голосовые и стикеры пока не разбираю."
+        f"{ICONS.info}  Я понимаю текст, голосовые сообщения, фотографии и "
+        "документы. Стикеры и другие типы сообщений пока не разбираю."
     )
 
 
@@ -760,6 +985,9 @@ async def main() -> None:
                 await remote.refresh(crm)
 
         ready = warm_up()  # заранее проверяем ключи, чтобы узнать о проблеме сразу
+        # Справочник организаций — после конфигурации панели: ключ для
+        # смыслового поиска может храниться только там.
+        init_knowledge()
         logger.info("Провайдер по умолчанию: %s", settings.default_provider)
         logger.info("Доступные провайдеры: %s", ", ".join(ready) or "нет")
         logger.info("Панель управления: %s",

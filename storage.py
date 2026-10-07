@@ -72,8 +72,21 @@ class Session:
     # Подтягивали ли мы историю из панели после перезапуска бота.
     restored: bool = False
 
+    # Что уже известно о жителе и обращении: ФИО, телефон, место (см.
+    # classify.update_ticket). Подставляется модели, чтобы она не
+    # переспрашивала то, что человек уже назвал.
+    known: dict = field(default_factory=dict)
+
+    # Организации из справочника, подходящие к разговору, — кандидаты
+    # в исполнители заявки: [{"id": ..., "name": ...}].
+    candidates: list[dict] = field(default_factory=list)
+
+    # id последнего сообщения жителя в панели: по нему classify.py просит
+    # вынести в новую заявку разговор о другой проблеме.
+    last_message_id: int | None = None
+
     def add(self, role: str, content: str, limit: int,
-             images: list[str] | None = None) -> None:
+            images: list[str] | None = None, crm_id: int | None = None) -> None:
         """
         Добавить сообщение в историю и обрезать её, если стала слишком длинной.
 
@@ -85,6 +98,9 @@ class Session:
         entry: dict = {"role": role, "content": content}
         if images:
             entry["images"] = images
+        if crm_id:
+            # id сообщения в панели — чтобы разделить заявку ровно по нему.
+            entry["crm_id"] = crm_id
         self.history.append(entry)
         if len(self.history) > limit:
             # Оставляем только последние `limit` сообщений.
@@ -98,6 +114,14 @@ class Session:
     def clear(self) -> None:
         self.history.clear()
         self.ticket_id = None
+        # Номер из WhatsApp или присланный кнопкой Telegram — свойство
+        # человека, а не разговора: его оставляем, остальное начинается
+        # заново вместе с новой заявкой.
+        keep = {k: self.known[k] for k in ("phone", "phone_source")
+                if k in self.known and self.known.get("phone_source") in ("channel", "shared")}
+        self.known = keep
+        self.candidates = []
+        self.last_message_id = None
 
     def drop_last(self) -> None:
         """Убрать последнее сообщение (используем, когда ответ не получился)."""

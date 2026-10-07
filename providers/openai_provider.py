@@ -17,6 +17,7 @@ providers/openai_provider.py — работа с GPT через официаль
 
 import base64
 import logging
+import re
 
 from openai import (
     APIConnectionError,
@@ -136,37 +137,8 @@ class OpenAIProvider(LLMProvider):
                     response = await self._create(messages, max_tokens)
                 else:
                     raise
-        except AuthenticationError:
-            raise ProviderError(
-                "OpenAI: неверный API-ключ (проверь OPENAI_API_KEY).", retryable=True
-            )
-        except PermissionDeniedError:
-            raise ProviderError(
-                f"OpenAI: нет доступа к модели {self._model}. "
-                "Проверь OPENAI_MODEL в .env и права ключа.",
-                retryable=True,
-            )
-        except RateLimitError:
-            raise ProviderError(
-                "OpenAI: лимит запросов или закончились средства на балансе.",
-                retryable=True,
-            )
-        except APITimeoutError:
-            raise ProviderError(
-                "OpenAI: сервер долго не отвечает. Попробуй ещё раз.", retryable=True
-            )
-        except APIConnectionError:
-            raise ProviderError(
-                "OpenAI: нет связи с сервером. Проверь интернет/VPN.", retryable=True
-            )
-        except BadRequestError as e:
-            raise ProviderError(f"OpenAI отклонил запрос: {_short(e)}")
-        except APIStatusError as e:
-            # 5xx — сломался сервер OpenAI, есть смысл переиграть на другой модели.
-            raise ProviderError(
-                f"OpenAI вернул ошибку {e.status_code}: {_short(e)}",
-                retryable=e.status_code >= 500,
-            )
+        except _API_ERRORS as e:
+            raise _to_provider_error(e, self._model) from None
 
         if not response.choices:
             raise ProviderError("GPT вернул пустой ответ. Попробуй переформулировать.")
@@ -186,6 +158,122 @@ class OpenAIProvider(LLMProvider):
                 raise ProviderError("GPT отказался отвечать: сработал фильтр содержимого.")
             raise ProviderError("GPT вернул пустой ответ. Попробуй переформулировать.")
         return text
+
+    async def search_web(self, system: str, history: list[dict], max_tokens: int) -> str:
+        """
+        Ответ с поиском в интернете (Responses API, инструмент web_search).
+
+        Зовётся только когда модель сама сказала, что в справочнике ответа
+        нет (см. prompts.parse_search_request) — поиск платный, на каждое
+        сообщение его не тратим. Фото в поиск не передаём: искать по ним
+        нечего, а токены они съедают.
+        """
+        messages = [{"role": h["role"], "content": h["content"]}
+                    for h in history if h.get("content")]
+        tool = {
+            "type": "web_search",
+            # Без этого поиск тянет ответы про Россию и Казахстан.
+            "user_location": {"type": "approximate", "country": "KG"},
+            # «low» — меньше страниц в контексте модели: дешевле,
+            # а для адреса или графика работы этого хватает.
+            "search_context_size": "low",
+        }
+        # Минимальная длина «рассуждений», которую принимает поиск
+        # (с «minimal» модели gpt-5 поиск не включают).
+        extra = {"reasoning": {"effort": "low"}} if self._reasoning_model else {}
+
+        async def create(tool: dict, extra: dict):
+            return await self._client.responses.create(
+                model=self._model,
+                instructions=system,
+                input=messages,
+                tools=[tool],
+                max_output_tokens=max_tokens,
+                **extra,
+            )
+
+        try:
+            try:
+                response = await create(tool, extra)
+            except BadRequestError as e:
+                # Не все модели принимают уточнения к поиску (страна, объём
+                # контекста, длину рассуждений). Один раз пробуем голый поиск.
+                logger.info("OpenAI: поиск с уточнениями отклонён (%s), пробую без них",
+                            _short(e))
+                response = await create({"type": "web_search"}, {})
+        except _API_ERRORS as e:
+            raise _to_provider_error(e, self._model) from None
+
+        text = plain_links((getattr(response, "output_text", "") or "").strip())
+        if not text:
+            raise ProviderError("Поиск не дал ответа. Попробуй переформулировать.")
+        return text
+
+
+# Ссылки в ответе с поиском приходят Markdown-разметкой: «([сайт](адрес))».
+# Мессенджер покажет её как есть, со скобками, поэтому переводим в обычный
+# текст: «сайт (адрес)» или просто «адрес», если подпись и есть адрес.
+_MD_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)")
+_UTM_RE = re.compile(r"([?&])utm_source=openai(&?)")
+
+
+def _drop_utm(url: str) -> str:
+    """Убрать метку utm_source=openai, не ломая остальные параметры адреса."""
+    def repl(m: re.Match) -> str:
+        return m.group(1) if m.group(2) else ""
+    return _UTM_RE.sub(repl, url)
+
+
+def plain_links(text: str) -> str:
+    """Markdown-ссылки и выделение -> обычный текст для мессенджера."""
+    def link(m: re.Match) -> str:
+        label, url = m.group(1).strip(), _drop_utm(m.group(2))
+        bare = re.sub(r"^https?://(www\.)?", "", url).rstrip("/")
+        if label.lower().removeprefix("www.") in bare.lower():
+            return url
+        return f"{label} ({url})"
+
+    text = _MD_LINK_RE.sub(link, text)
+    text = re.sub(r"\((https?://[^\s)]+)\)", lambda m: f"({_drop_utm(m.group(1))})", text)
+    # Жирный/курсив Markdown и заголовки «## ...» — тоже просто текстом.
+    text = re.sub(r"(\*\*|__)(.+?)\1", r"\2", text)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    return text
+
+# Ошибки SDK, которые переводим в понятную человеку ProviderError.
+_API_ERRORS = (AuthenticationError, PermissionDeniedError, RateLimitError,
+               APITimeoutError, APIConnectionError, BadRequestError, APIStatusError)
+
+
+def _to_provider_error(e: Exception, model: str) -> ProviderError:
+    """Ошибка SDK -> ProviderError с текстом для чата и признаком «переиграть»."""
+    if isinstance(e, AuthenticationError):
+        return ProviderError(
+            "OpenAI: неверный API-ключ (проверь OPENAI_API_KEY).", retryable=True)
+    if isinstance(e, PermissionDeniedError):
+        return ProviderError(
+            f"OpenAI: нет доступа к модели {model}. "
+            "Проверь OPENAI_MODEL в .env и права ключа.",
+            retryable=True,
+        )
+    if isinstance(e, RateLimitError):
+        return ProviderError(
+            "OpenAI: лимит запросов или закончились средства на балансе.",
+            retryable=True,
+        )
+    if isinstance(e, APITimeoutError):
+        return ProviderError(
+            "OpenAI: сервер долго не отвечает. Попробуй ещё раз.", retryable=True)
+    if isinstance(e, APIConnectionError):
+        return ProviderError(
+            "OpenAI: нет связи с сервером. Проверь интернет/VPN.", retryable=True)
+    if isinstance(e, BadRequestError):
+        return ProviderError(f"OpenAI отклонил запрос: {_short(e)}")
+    # 5xx — сломался сервер OpenAI, есть смысл переиграть на другой модели.
+    return ProviderError(
+        f"OpenAI вернул ошибку {e.status_code}: {_short(e)}",
+        retryable=e.status_code >= 500,
+    )
 
 
 def _short(error: Exception, limit: int = 200) -> str:

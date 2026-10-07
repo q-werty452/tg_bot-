@@ -20,8 +20,9 @@ Telegram, статус «печатает», разбиение через messa
 двухшаговому протоколу Meta (media_id -> временная ссылка -> файл) и уходят
 в панель как вложение — аналогично bot.py:handle_media() для Telegram. Фото
 (type="image") дополнительно уходит модели как vision-вложение — она его
-реально видит. Голос, видео, стикеры, локация и т.п. — фиксированный ответ,
-обращение не заводится.
+реально видит. Голосовые (type="audio") расшифровываются через transcribe.py
+и дальше идут как обычный текст жителя, а сам файл — вложением в панель.
+Видео, стикеры, локация и т.п. — фиксированный ответ, обращение не заводится.
 """
 
 import asyncio
@@ -37,9 +38,17 @@ from typing import Any
 import httpx
 from aiohttp import web
 
-from classify import classify_ticket, refine_ticket
+import transcribe as transcribe_module
+from classify import describe_known, forget_ticket, update_ticket
 from config import settings
-from conversation import ask_with_fallback, restore_history
+from conversation import (
+    ask_assistant,
+    background,
+    init_knowledge,
+    knowledge_context,
+    restore_history,
+    with_context,
+)
 from crm import crm
 from icons import clean_text
 from logging_setup import setup_logging
@@ -47,6 +56,11 @@ from prompts import MAX_TOKENS, build_system
 from providers import ProviderError, available_providers, is_available, warm_up
 from remote_config import RemoteConfig
 from storage import Mode, Storage
+from transcribe import (
+    UNRECOGNIZED_CARD_TEXT,
+    UNRECOGNIZED_REPLY,
+    TranscribeError,
+)
 from utils import split_text
 
 logger = logging.getLogger(__name__)
@@ -109,14 +123,26 @@ def parse_webhook_payload(payload: dict) -> list[dict]:
                 mtype = m.get("type") or "unknown"
                 text = ""
                 media_id = media_mime = media_filename = None
+                location = None
                 if mtype == "text":
                     text = (m.get("text") or {}).get("body", "")
-                elif mtype in ("image", "document"):
+                elif mtype in ("image", "document", "audio"):
+                    # Голосовые — это тот же "audio", только с voice: true.
+                    # Подписи у аудио нет, text останется пустым.
                     media = m.get(mtype) or {}
                     media_id = media.get("id")
                     media_mime = media.get("mime_type", "")
                     media_filename = media.get("filename", "")
                     text = media.get("caption", "") or ""
+                elif mtype == "location":
+                    # Точка с карты: координаты и (если житель выбрал место
+                    # из списка) название и адрес от самого WhatsApp.
+                    loc = m.get("location") or {}
+                    try:
+                        location = (float(loc["latitude"]), float(loc["longitude"]))
+                    except (KeyError, TypeError, ValueError):
+                        location = None
+                    text = ", ".join(x for x in (loc.get("name"), loc.get("address")) if x)
                 messages.append({
                     "phone": phone,
                     "type": mtype,
@@ -126,6 +152,7 @@ def parse_webhook_payload(payload: dict) -> list[dict]:
                     "media_id": media_id,
                     "media_mime": media_mime,
                     "media_filename": media_filename,
+                    "location": location,
                 })
     return messages
 
@@ -221,7 +248,9 @@ async def download_whatsapp_media(media_id: str, mime: str, filename: str) -> Pa
             return None
 
     MEDIA_DIR.mkdir(exist_ok=True)
-    ext = mimetypes.guess_extension(mime or "") or ""
+    # Для звука берём своё расширение: mimetypes не знает "audio/ogg; codecs=opus"
+    # из голосовых WhatsApp, а расшифровке нужен правильный суффикс (.ogg).
+    ext = transcribe_module.ext_for_mime(mime) or mimetypes.guess_extension(mime or "") or ""
     safe_name = "".join(c for c in (filename or "") if c.isalnum() or c in "._-")
     path = MEDIA_DIR / f"{media_id}_{safe_name or ('file' + ext)}"
     path.write_bytes(content)
@@ -267,15 +296,85 @@ async def handle_incoming_message(msg: dict) -> None:
                      citizen_text=caption, image_paths=image_paths)
         return
 
+    if msg["type"] == "audio":
+        await handle_audio(msg, phone)
+        return
+
+    if msg["type"] == "location" and msg.get("location"):
+        # Точка на карте — самый точный «адрес»: в карточку уходят координаты
+        # (панель ставит заявку на карту и сама определяет район), модели —
+        # пометка, чтобы не переспрашивала улицу и дом.
+        lat, lon = msg["location"]
+        place = (msg.get("text") or "").strip()
+        model_text = "[Житель отправил точку на карте — место отмечено]"
+        if place:
+            model_text += f" {place}"
+        await respond(msg, phone, model_text,
+                      citizen_text=f"[Геометка] {lat:.6f}, {lon:.6f}" + (f" — {place}" if place else ""),
+                      pin=(lat, lon))
+        return
+
     await send_whatsapp_text(
-        phone, "Пока я могу обрабатывать только текст, фото и документы. "
-              "Опишите обращение текстом, пожалуйста.")
+        phone, "Пока я могу обрабатывать только текст, голосовые сообщения, "
+              "фото и документы. Опишите обращение текстом, пожалуйста.")
+
+
+async def handle_audio(msg: dict, phone: str) -> None:
+    """
+    Голосовое сообщение или аудиофайл — аналог handle_voice() из bot.py.
+
+    Расшифровка уходит модели с пометкой «возможны ошибки распознавания»,
+    в карточку — расшифровка плюс сам файл (сотрудник может прослушать).
+    Если речь разобрать не удалось, житель получает вежливую просьбу
+    повторить, а запись всё равно попадает в панель.
+    """
+    if not remote.bot_enabled:
+        # Бот выключен: respond() ответит текстом техработ, расшифровка
+        # (она платная) не нужна.
+        await respond(msg, phone, UNRECOGNIZED_CARD_TEXT)
+        return
+
+    media_id = msg.get("media_id")
+    mime = msg.get("media_mime") or ""
+    path = await download_whatsapp_media(
+        media_id, mime, msg.get("media_filename") or "",
+    ) if media_id else None
+    if path is None:
+        await send_whatsapp_text(
+            phone, "Не получилось принять голосовое сообщение. Попробуйте "
+                  "отправить ещё раз или опишите обращение текстом.")
+        return
+
+    reply = UNRECOGNIZED_REPLY
+    text = ""
+    try:
+        text = await transcribe_module.transcribe(str(path), mime=mime)
+    except TranscribeError as e:
+        # Детали (ключ, баланс, сеть) — только в лог; жителю — общий текст.
+        logger.warning("WhatsApp: расшифровка голосового не удалась: %s", e.message)
+        COUNTERS["errors"] += 1
+        reply = e.public_text or UNRECOGNIZED_REPLY
+    except Exception:
+        logger.exception("WhatsApp: сбой расшифровки голосового")
+        COUNTERS["errors"] += 1
+
+    if not text:
+        await respond(msg, phone, UNRECOGNIZED_CARD_TEXT,
+                      file_paths=[str(path)], fixed_reply=reply)
+        return
+
+    model_text = ("[Голосовое сообщение, автоматическая расшифровка — "
+                  f"возможны ошибки распознавания] {text}")
+    await respond(msg, phone, model_text,
+                  file_paths=[str(path)], citizen_text=f"[Голосовое] {text}")
 
 
 async def respond(msg: dict, phone: str, user_text: str,
                   file_paths: list[str] | None = None,
                   citizen_text: str | None = None,
-                  image_paths: list[str] | None = None) -> None:
+                  image_paths: list[str] | None = None,
+                  fixed_reply: str | None = None,
+                  pin: tuple[float, float] | None = None) -> None:
     """
     Общий путь любого обращения WhatsApp — аналог respond() из bot.py.
 
@@ -283,6 +382,10 @@ async def respond(msg: dict, phone: str, user_text: str,
     отличается от текста для модели (случай фото/документа с подписью или без).
     image_paths — пути к фото, которые нужно реально показать модели
     (vision), а не просто прикрепить к карточке (см. file_paths).
+    fixed_reply — готовый ответ вместо обращения к модели (нераспознанное
+    голосовое): обращение с файлом попадает в панель, а при ведении диалога
+    сотрудником бот по-прежнему молчит. В историю модели реплика не идёт.
+    pin — координаты точки, которую житель отправил с карты.
     """
     chat_id = int(phone)
     session = storage.get(chat_id)
@@ -296,6 +399,10 @@ async def respond(msg: dict, phone: str, user_text: str,
         logger.error("WhatsApp: нет доступной модели, сообщение от %s не обработано", phone)
         return
 
+    # Номер жителя в WhatsApp известен всегда — это сам адрес чата. Модель
+    # не должна его спрашивать (см. classify.describe_known).
+    session.known["phone"], session.known["phone_source"] = phone, "channel"
+
     async with session.lock:
         await restore_history(session, chat_id, crm, settings.history_limit,
                               channel="whatsapp")
@@ -305,30 +412,38 @@ async def respond(msg: dict, phone: str, user_text: str,
             citizen_text if citizen_text is not None else user_text,
             tg_message_id=None, file_paths=file_paths,
         )
+        crm_id = None
         if record:
-            session.ticket_id = record.get("ticket_id")
-            if record.get("created") and session.ticket_id:
-                asyncio.create_task(classify_ticket(
-                    crm, session.ticket_id, user_text, session.provider))
-                asyncio.create_task(refine_ticket(
-                    crm, session.ticket_id, session.provider))
+            _follow_ticket(session, record)
+            crm_id = session.last_message_id
+            if pin and session.ticket_id:
+                session.known["pin"] = True
+                background(crm.classify(session.ticket_id,
+                                        {"lat": pin[0], "lon": pin[1]}))
             if record.get("answer_mode") == "staff":
                 # Разговор перехватил сотрудник — ответ уйдёт через очередь
                 # исходящих (см. outbox_send_loop), ИИ здесь молчит.
                 return
 
+        if fixed_reply is not None:
+            await _deliver_answer(phone, session, fixed_reply)
+            return
+
         quick = remote.match_quick_answer(user_text)
         if quick:
             COUNTERS["quick_answers"] += 1
             answer = quick["answer"]
-            session.add("user", user_text, settings.history_limit, images=image_paths)
+            session.add("user", user_text, settings.history_limit,
+                        images=image_paths, crm_id=crm_id)
             session.add("assistant", answer, settings.history_limit)
             if quick.get("id"):
-                asyncio.create_task(crm.answer_hit(quick["id"]))
+                background(crm.answer_hit(quick["id"]))
             await _deliver_answer(phone, session, answer)
+            _after_answer(session)
             return
 
-        session.add("user", user_text, settings.history_limit, images=image_paths)
+        session.add("user", user_text, settings.history_limit,
+                    images=image_paths, crm_id=crm_id)
 
         detailed = session.mode is Mode.DETAILED
         system = build_system(
@@ -340,10 +455,13 @@ async def respond(msg: dict, phone: str, user_text: str,
         max_tokens = MAX_TOKENS[session.mode]
 
         try:
-            answer, answered_by = await ask_with_fallback(
+            knowledge = await knowledge_context(session, session.mode)
+            history = with_context(session.history, knowledge=knowledge,
+                                   citizen=describe_known(session.known))
+            answer, answered_by = await ask_assistant(
                 preferred=session.provider,
                 system=system,
-                history=session.history,
+                history=history,
                 max_tokens=max_tokens,
                 detailed=detailed,
             )
@@ -376,6 +494,23 @@ async def respond(msg: dict, phone: str, user_text: str,
         session.add("assistant", answer, settings.history_limit)
         COUNTERS["answers"] += 1
         await _deliver_answer(phone, session, answer)
+        _after_answer(session)
+
+
+def _follow_ticket(session, record: dict) -> None:
+    """Запомнить заявку сообщения; новая заявка — тема и место заново (как в bot.py)."""
+    ticket_id = record.get("ticket_id")
+    if ticket_id and session.ticket_id and ticket_id != session.ticket_id:
+        forget_ticket(session)
+    if ticket_id:
+        session.ticket_id = ticket_id
+    session.last_message_id = record.get("message_id")
+
+
+def _after_answer(session) -> None:
+    """После ответа — фоново дозаполнить карточку по переписке."""
+    if session.ticket_id:
+        background(update_ticket(crm, session, session.provider))
 
 
 async def _deliver_answer(phone: str, session, answer: str) -> None:
@@ -408,7 +543,7 @@ async def receive_webhook(request: web.Request) -> web.Response:
     except ValueError:
         return web.Response(status=200)  # мусор от Meta — не наша забота, но и не 500
     for msg in parse_webhook_payload(payload):
-        asyncio.create_task(handle_incoming_message(msg))
+        background(handle_incoming_message(msg))
     return web.Response(status=200)
 
 
@@ -496,6 +631,9 @@ async def main() -> None:
             await remote.refresh(crm)
 
     ready = warm_up()
+    # Справочник организаций — после конфигурации панели: ключ для
+    # смыслового поиска может храниться только там.
+    init_knowledge()
     logger.info("WhatsApp-бот запускается на порту %s", settings.whatsapp_port)
     logger.info("Доступные провайдеры: %s", ", ".join(ready) or "нет")
 

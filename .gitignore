@@ -24,3 +24,5 @@ crm_config_cache.json
 crm_config_cache_whatsapp.json
 incoming_media/
 README.md
+# Кэш эмбеддингов справочника
+knowledge_cache/

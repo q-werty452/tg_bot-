@@ -120,6 +120,16 @@ class CRM:
             "POST", f"/tickets/{ticket_id}/retitle/", json={"title": title})
         return bool(result and result.get("applied"))
 
+    async def split(self, ticket_id: int, from_message_id: int,
+                    title: str = "") -> dict | None:
+        """
+        Житель заговорил о другой проблеме: сообщения начиная с from_message_id
+        переезжают в новую заявку. Вернёт {ticket_id, number} новой или None.
+        """
+        return await self._request(
+            "POST", f"/tickets/{ticket_id}/split/",
+            json={"from_message_id": from_message_id, "title": title})
+
     async def history(self, ticket_id: int, limit: int = 30) -> dict | None:
         return await self._request(
             "GET", f"/tickets/{ticket_id}/history/", params={"limit": limit})

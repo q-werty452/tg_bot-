@@ -10,6 +10,7 @@ config.py — все настройки в одном месте.
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -20,6 +21,9 @@ load_dotenv()
 # Порядок важен: если провайдер по умолчанию недоступен, берём первый
 # доступный из этого списка.
 PROVIDER_ORDER = ("openai", "gemini", "claude", "openrouter")
+
+# Папка бота — от неё считаются пути по умолчанию для справочника и его кэша.
+BASE_DIR = Path(__file__).resolve().parent
 
 
 class ConfigError(RuntimeError):
@@ -51,6 +55,12 @@ class Settings:
     meta_phone_number_id: str
     meta_graph_api_version: str
     whatsapp_port: int
+    # Справочник организаций (knowledge.py). По умолчанию лежит рядом с ботом,
+    # в соседней папке jalal-abad-data. Нет папки — бот работает как раньше.
+    knowledge_dir: Path = BASE_DIR.parent / "jalal-abad-data" / "knowledge_platform" / "knowledge_output" / "v4" / "runtime_export"
+    # Кэш эмбеддингов справочника: чтобы не платить за них при каждом старте.
+    knowledge_cache_dir: Path = BASE_DIR / "knowledge_cache"
+    embedding_model: str = "text-embedding-3-small"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -149,6 +159,12 @@ def load_settings() -> Settings:
         meta_phone_number_id=_env("META_PHONE_NUMBER_ID"),
         meta_graph_api_version=_env("META_GRAPH_API_VERSION") or "v21.0",
         whatsapp_port=_env_int("WHATSAPP_PORT", 8081, minimum=1, maximum=65535),
+        knowledge_dir=(
+            Path(_env("KNOWLEDGE_DIR")).expanduser() if _env("KNOWLEDGE_DIR")
+            else Settings.knowledge_dir
+        ),
+        knowledge_cache_dir=BASE_DIR / "knowledge_cache",
+        embedding_model=_env("EMBEDDING_MODEL") or "text-embedding-3-small",
     )
 
 
