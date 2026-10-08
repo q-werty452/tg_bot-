@@ -286,6 +286,11 @@ async def knowledge_context(session, mode: str) -> str:
     query = search_query(session.history)
     if not query:
         return ""
+    # Уточнение «а номер есть?» само по себе ничего не найдёт: подмешиваем
+    # суть текущего обращения (её знает classify.py), чтобы искать по теме.
+    summary = session.known.get("summary") or ""
+    if summary and len(query) < SHORT_QUERY_CHARS * 2:
+        query = f"{summary} {query}"
     hint = ", ".join(session.known[k] for k in ("district_name", "settlement")
                      if session.known.get(k))
     try:
