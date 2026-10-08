@@ -51,3 +51,6 @@ class OpenRouterProvider(OpenAIProvider):
         )
         self._model = model
         self._legacy_token_param = False
+        # Те же признаки, что у родителя (OpenAIProvider._create их читает):
+        # без этого поля любой запрос через OpenRouter падал с AttributeError.
+        self._reasoning_model = model.split("/")[-1].startswith("gpt-5")

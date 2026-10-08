@@ -2519,6 +2519,23 @@ async def test_assistant_pipeline() -> None:
           all("images" not in m for m in created[-1]["input"]), str(created[-1]["input"]))
     check("OpenAI-поиск: ссылки и выделение — обычным текстом",
           text == "ЦОН: пн-пт (https://tunduk.gov.kg/a). Важно.", text)
+    import providers as _providers
+    from providers.openrouter import OpenRouterProvider
+    _providers.apply_overrides({"openrouter": {"key": "sk-or-test", "model": "aion-labs/aion-2.0"}})
+    router = OpenRouterProvider()
+    sent: list[dict] = []
+
+    async def fake_chat(**kwargs):
+        sent.append(kwargs)
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="Ответ OpenRouter"), finish_reason="stop")])
+
+    router._client = types.SimpleNamespace(chat=types.SimpleNamespace(
+        completions=types.SimpleNamespace(create=fake_chat)))
+    answer = await router.ask("SYS", [{"role": "user", "content": "q"}], 100, False)
+    check("OpenRouter: запрос проходит (нет падения на _reasoning_model)",
+          answer == "Ответ OpenRouter" and "reasoning_effort" not in sent[0], str(sent[:1])[:200])
+    _providers.apply_overrides({})
     check("ссылка с подписью сохраняет подпись",
           plain_links("[Портал](https://portal.kg/?a=1&utm_source=openai)") == "Портал (https://portal.kg/?a=1)")
 
