@@ -54,3 +54,4 @@ class OpenRouterProvider(OpenAIProvider):
         # Те же признаки, что у родителя (OpenAIProvider._create их читает):
         # без этого поля любой запрос через OpenRouter падал с AttributeError.
         self._reasoning_model = model.split("/")[-1].startswith("gpt-5")
+        self._no_temperature = False

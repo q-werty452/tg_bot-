@@ -8,7 +8,7 @@ providers/openai_provider.py — работа с GPT через официаль
 3. Лимит длины передаём как max_completion_tokens (современное имя;
    старое max_tokens считается устаревшим, но часть моделей и прокси
    до сих пор понимают только его — см. фолбэк ниже).
-4. temperature не передаём: часть новых «рассуждающих» моделей его не принимает.
+4. temperature передаём только обычным моделям: «рассуждающие» его не принимают.
    Стиль задаём промптом — так надёжнее.
 
 Файл называется openai_provider.py, а не openai.py, специально:
@@ -35,6 +35,9 @@ from providers.base import LLMProvider, ProviderError
 from utils import read_image
 
 logger = logging.getLogger(__name__)
+
+# Насколько «творчески» отвечает модель: 0 — всегда одинаково, 1 — по-разному.
+TEMPERATURE = 0.2
 
 
 def _to_message(item: dict) -> dict:
@@ -97,11 +100,16 @@ class OpenAIProvider(LLMProvider):
         # reasoning_effort="minimal" сводит эти траты почти к нулю — нам
         # для короткого чат-ответа глубокие рассуждения и не нужны.
         self._reasoning_model = model.startswith("gpt-5")
+        self._no_temperature = False
 
     async def _create(self, messages: list[dict], max_tokens: int):
         """Один вызов API с учётом того, как эта модель называет лимит токенов."""
         limit_field = "max_tokens" if self._legacy_token_param else "max_completion_tokens"
-        extra = {"reasoning_effort": "minimal"} if self._reasoning_model else {}
+        # Обычным моделям — низкая «температура»: на один и тот же вопрос
+        # житель должен получать один и тот же ответ, а не каждый раз новый.
+        # «Рассуждающие» модели температуру не принимают.
+        extra = ({"reasoning_effort": "minimal"} if self._reasoning_model
+                 else {} if self._no_temperature else {"temperature": TEMPERATURE})
         return await self._client.chat.completions.create(
             model=self._model,
             messages=messages,
@@ -128,6 +136,11 @@ class OpenAIProvider(LLMProvider):
                     # Модель не знает max_completion_tokens — пробуем старое имя.
                     logger.info("OpenAI: модель %s требует max_tokens, переключаюсь", self._model)
                     self._legacy_token_param = True
+                    response = await self._create(messages, max_tokens)
+                elif not self._reasoning_model and "temperature" in text and not self._no_temperature:
+                    # Модель не принимает temperature — отвечаем без неё.
+                    logger.info("OpenAI: модель %s не знает temperature, отключаю", self._model)
+                    self._no_temperature = True
                     response = await self._create(messages, max_tokens)
                 elif self._reasoning_model and "reasoning_effort" in text:
                     # Модель не принимает reasoning_effort — не рассуждающая,

@@ -304,10 +304,31 @@ async def knowledge_context(session, mode: str) -> str:
         found = kb.candidate_organizations(hits)
         if found:
             session.candidates = _merge_candidates(found, session.candidates)
-        return kb.format_context(hits, arts, max_chars=KNOWLEDGE_MAX_CHARS.get(mode, 1800))
+        block = kb.format_context(hits, arts, max_chars=KNOWLEDGE_MAX_CHARS.get(mode, 1800))
+        if block and not hint and not _names_place(kb, " ".join(
+                strip_service(m.get("content") or "") for m in session.history if m.get("role") == "user")):
+            # Житель нигде не назвал, где живёт, — найденное может быть про
+            # чужой район. Без этой пометки модель уверенно отправляла
+            # человека из любого села в случайную районную администрацию.
+            block += ("\nВНИМАНИЕ: житель не назвал свой район, город или село. Записи выше "
+                      "могут относиться к другому району — не называй районные контакты, "
+                      "сначала спроси, где он живёт. Общеобластное (полпредство, график "
+                      "приёма руководителей) можно называть сразу.")
+        return block
     except Exception:
         logger.exception("Поиск по справочнику упал — отвечаю без него")
         return ""
+
+
+def _names_place(kb, text: str) -> bool:
+    """Назван ли в тексте район, город или село области."""
+    infer = getattr(kb, "_infer_territories", None)
+    if infer is None:
+        return True      # не умеем проверить — не мешаем ответу
+    try:
+        return bool(infer(text))
+    except Exception:
+        return True
 
 
 async def _lookup(kb, query: str, hint: str, embed):
