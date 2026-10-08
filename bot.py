@@ -939,6 +939,10 @@ async def cleanup_loop() -> None:
             logger.info("Убрано неактивных сессий: %s (осталось %s)", removed, len(storage))
 
 
+# Пауза перед новой попыткой подключиться к Telegram при сбое сети.
+NETWORK_RETRY_SECONDS = 15
+
+
 async def main() -> None:
     global _active_token
     setup_logging()
@@ -970,10 +974,13 @@ async def main() -> None:
             )
             return
         except TelegramNetworkError as e:
+            # Сеть моргнула (DNS, Wi-Fi) — не выходим, а ждём и пробуем снова:
+            # бот для жителей не должен падать от минутного сбоя интернета.
             await bot.session.close()
-            logger.error("Нет связи с Telegram: %s. Проверь интернет и доступ "
-                         "к api.telegram.org.", e)
-            return
+            logger.error("Нет связи с Telegram: %s. Повтор через %s с.", e,
+                         NETWORK_RETRY_SECONDS)
+            await asyncio.sleep(NETWORK_RETRY_SECONDS)
+            continue
 
         logger.info("Бот запущен: @%s (id %s)", me.username, me.id)
 
