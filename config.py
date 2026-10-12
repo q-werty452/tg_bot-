@@ -26,6 +26,14 @@ PROVIDER_ORDER = ("openai", "gemini", "claude", "openrouter")
 BASE_DIR = Path(__file__).resolve().parent
 
 
+def _default_knowledge_dir() -> Path:
+    """Справочник по умолчанию: свежая версия v5 (с ответами администрации),
+    а если её ещё нет на этом компьютере — v4."""
+    root = BASE_DIR.parent / "jalal-abad-data" / "knowledge_platform" / "knowledge_output"
+    v5 = root / "v5" / "runtime_export"
+    return v5 if v5.is_dir() else root / "v4" / "runtime_export"
+
+
 class ConfigError(RuntimeError):
     """Ошибка настройки — показывается человеку при запуске понятным текстом."""
 
@@ -57,7 +65,7 @@ class Settings:
     whatsapp_port: int
     # Справочник организаций (knowledge.py). По умолчанию лежит рядом с ботом,
     # в соседней папке jalal-abad-data. Нет папки — бот работает как раньше.
-    knowledge_dir: Path = BASE_DIR.parent / "jalal-abad-data" / "knowledge_platform" / "knowledge_output" / "v4" / "runtime_export"
+    knowledge_dir: Path = _default_knowledge_dir()
     # Кэш эмбеддингов справочника: чтобы не платить за них при каждом старте.
     knowledge_cache_dir: Path = BASE_DIR / "knowledge_cache"
     embedding_model: str = "text-embedding-3-small"
